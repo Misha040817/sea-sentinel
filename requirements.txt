@@ -1,0 +1,8 @@
+streamlit
+inference-sdk
+python-dotenv
+Pillow
+pandas
+numpy
+plotly
+opencv-python-headless
