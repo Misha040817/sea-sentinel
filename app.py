@@ -1,4 +1,4 @@
-import os, io, cv2, tempfile, base64, sqlite3, json
+import os, io, cv2, tempfile, base64, sqlite3, json, subprocess, shutil, time
 from datetime import datetime
 from collections import Counter
 import numpy as np
@@ -175,7 +175,7 @@ html, body, [class*="css"] { color:#F4FAFD !important; }
 # ---------------- STATE ----------------
 for key, default in {
     'image_predictions':[], 'image_obj':None, 'image_name':None, 'history':[],
-    'video_stats':None, 'video_output':None
+    'video_stats':None, 'video_output':None, 'video_original':None, 'video_original_name':None, 'video_last_original':None, 'video_last_annotated':None, 'video_last_result':None, 'resilience_result':None
 }.items():
     if key not in st.session_state: st.session_state[key] = default
 
@@ -262,6 +262,79 @@ def draw_detections(image,predictions,thickness=3):
 def png_bytes(img):
     b=io.BytesIO(); img.save(b,format='PNG'); return b.getvalue()
 
+def draw_video_detections(image, predictions, thickness=6):
+    """Competition-readable annotations for Video Detection only."""
+    out=image.copy(); draw=ImageDraw.Draw(out)
+    # Scale label text with video resolution while keeping it readable on large displays.
+    font_size=max(22, min(28, int(min(out.size) * 0.040)))
+    font=None
+    for font_name in ('arialbd.ttf','Arial Bold.ttf','arial.ttf'):
+        try:
+            font=ImageFont.truetype(font_name,font_size); break
+        except Exception:
+            pass
+    if font is None: font=ImageFont.load_default()
+    line_width=max(3, min(4, int(thickness)))
+    for p in predictions:
+        x,y,w,h=[p.get(k,0) for k in ('x','y','width','height')]
+        conf=float(p.get('confidence',0) or 0); cls=pretty(p.get('class','unknown')).upper()
+        x1,y1,x2,y2=int(x-w/2),int(y-h/2),int(x+w/2),int(y+h/2)
+        draw.rectangle([x1,y1,x2,y2],outline='#22D3EE',width=line_width)
+        label=f'{cls}  {conf*100:.1f}%'
+        box=draw.textbbox((0,0),label,font=font); tw,th=box[2]-box[0],box[3]-box[1]
+        pad_x=max(10,font_size//3); pad_y=max(6,font_size//5)
+        label_h=th+2*pad_y
+        ly=y1-label_h if y1>=label_h else y1
+        label_w=tw+2*pad_x
+        lx=max(0, min(x1, out.size[0]-label_w))
+        draw.rounded_rectangle([lx,ly,lx+label_w,ly+label_h],radius=5,fill='#061827',outline='#22D3EE',width=2)
+        draw.text((lx+pad_x,ly+pad_y),label,fill='#FFFFFF',font=font)
+    return out
+
+# ---------------- MODEL RESILIENCE HELPERS ----------------
+def apply_visual_degradation(image, degradation, severity):
+    """Create a controlled degraded copy of a PIL image for resilience testing."""
+    rgb = np.array(image.convert('RGB'))
+    level = max(1, min(int(severity), 5))
+
+    if degradation == 'Gaussian Noise':
+        sigma = [8, 16, 25, 35, 48][level - 1]
+        noise = np.random.default_rng(42).normal(0, sigma, rgb.shape)
+        degraded = np.clip(rgb.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    elif degradation == 'Blur':
+        kernel = [3, 5, 7, 11, 15][level - 1]
+        degraded = cv2.GaussianBlur(rgb, (kernel, kernel), 0)
+
+    elif degradation == 'Low Light':
+        factor = [0.80, 0.65, 0.50, 0.35, 0.22][level - 1]
+        degraded = np.clip(rgb.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+
+    elif degradation == 'Fog / Haze':
+        alpha = [0.12, 0.22, 0.32, 0.45, 0.58][level - 1]
+        haze = np.full_like(rgb, 225)
+        degraded = cv2.addWeighted(rgb, 1.0 - alpha, haze, alpha, 0)
+        blur_kernel = [1, 3, 3, 5, 7][level - 1]
+        if blur_kernel > 1:
+            degraded = cv2.GaussianBlur(degraded, (blur_kernel, blur_kernel), 0)
+    else:
+        degraded = rgb.copy()
+
+    return Image.fromarray(degraded)
+
+def summarize_predictions(predictions):
+    """Return compact detection statistics without treating detections as unique vessels."""
+    predictions = predictions or []
+    confidences = [float(p.get('confidence', 0) or 0) for p in predictions]
+    top = max(predictions, key=lambda p: float(p.get('confidence', 0) or 0), default=None)
+    return {
+        'detections': len(predictions),
+        'avg_confidence': float(np.mean(confidences)) if confidences else 0.0,
+        'max_confidence': float(max(confidences)) if confidences else 0.0,
+        'top_class': pretty(top.get('class', 'None')) if top else 'No Detection',
+        'top_confidence': float(top.get('confidence', 0) or 0) if top else 0.0,
+    }
+
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sea_sentinel_history.db')
 
 def init_db():
@@ -318,7 +391,7 @@ def history_preview(limit=8, heading='Recent Detection History'):
     view['timestamp'] = pd.to_datetime(view['timestamp']).dt.strftime('%d %b %Y, %H:%M:%S')
     view['avg_confidence'] = (view['avg_confidence'] * 100).round(1).astype(str) + '%'
     view.columns = ['Date / Time','Source','File','Detections','Avg Confidence','Vessel Types']
-    st.dataframe(view, use_container_width=True, hide_index=True)
+    st.dataframe(view, width='stretch', hide_index=True)
     st.caption(f'Persistent local history database: {os.path.basename(DB_PATH)} • {len(hist)} recent record(s) shown')
 
 init_db()
@@ -336,7 +409,7 @@ def detection_controls(prefix='img'):
 with st.sidebar:
     st.markdown('<div class="brand"><h2>🌊 SEA SENTINEL</h2><p>Maritime Vision Intelligence</p></div>',unsafe_allow_html=True)
     st.markdown('<div class="eyebrow">NAVIGATION</div>',unsafe_allow_html=True)
-    page=st.radio('Page',['Dashboard','Image Detection','Video Detection','Detection Analytics','Dataset Analytics','Model Performance','Methodology','About Sea Sentinel'],label_visibility='collapsed')
+    page=st.radio('Page',['Dashboard','Image Detection','Video Detection','Live Detection','Detection Analytics','Dataset Analytics','Model Performance','Methodology','About Sea Sentinel'],label_visibility='collapsed')
     st.markdown('<div class="eyebrow">SYSTEM</div>',unsafe_allow_html=True)
     st.caption('Model · YOLO26 Nano')
     st.caption('Workflow · Roboflow')
@@ -354,7 +427,7 @@ if page=='Dashboard':
     with left:
         st.markdown('<div class="section">Dataset Class Distribution</div>',unsafe_allow_html=True)
         df=pd.DataFrame({'Vessel':DATASET_COUNTS.keys(),'Images':DATASET_COUNTS.values()})
-        fig=px.bar(df,x='Vessel',y='Images',text='Images'); fig.update_traces(textposition='outside'); st.plotly_chart(transparent(fig),use_container_width=True,config={'displayModeBar':False})
+        fig=px.bar(df,x='Vessel',y='Images',text='Images'); fig.update_traces(textposition='outside'); st.plotly_chart(transparent(fig),width='stretch',config={'displayModeBar':False})
     with right:
         st.markdown('<div class="section">Model Performance</div>',unsafe_allow_html=True)
         mc=st.columns(2)
@@ -374,7 +447,7 @@ elif page=='Image Detection':
         upload=st.file_uploader('Upload maritime image',type=['jpg','jpeg','png'],key='image_upload')
         if upload:
             image=Image.open(upload).convert('RGB')
-            if st.button('🚀 Run Object Detection',type='primary',use_container_width=True):
+            if st.button('🚀 Run Object Detection',type='primary',width='stretch'):
                 with st.spinner('Sea Sentinel is analysing the image...'):
                     try:
                         preds=run_workflow(image,classes,conf,text_scale,box,box_palette,label_palette)
@@ -385,8 +458,8 @@ elif page=='Image Detection':
         if st.session_state.image_obj is not None:
             image=st.session_state.image_obj; preds=st.session_state.image_predictions; annotated=draw_detections(image,preds,box)
             a,b=st.columns(2)
-            with a: st.markdown('<div class="section">Input</div>',unsafe_allow_html=True); st.image(image,use_container_width=True)
-            with b: st.markdown('<div class="section">Output</div>',unsafe_allow_html=True); st.image(annotated,use_container_width=True); st.download_button('⬇ Download Detected Image',png_bytes(annotated),'sea_sentinel_detection.png','image/png',use_container_width=True)
+            with a: st.markdown('<div class="section">Input</div>',unsafe_allow_html=True); st.image(image,width='stretch')
+            with b: st.markdown('<div class="section">Output</div>',unsafe_allow_html=True); st.image(annotated,width='stretch'); st.download_button('⬇ Download Detected Image',png_bytes(annotated),'sea_sentinel_detection.png','image/png',width='stretch')
             confidences=[p.get('confidence',0) for p in preds]; classes_found=[pretty(p.get('class','unknown')) for p in preds]
             metrics=st.columns(4); vals=[('Vessels Detected',len(preds)),('Average Confidence',f'{np.mean(confidences)*100:.1f}%' if confidences else '0.0%'),('Vessel Types',len(set(classes_found))),('Highest Confidence',f'{max(confidences)*100:.1f}%' if confidences else '0.0%')]
             for c,(n,v) in zip(metrics,vals):
@@ -402,8 +475,24 @@ elif page=='Video Detection':
         frame_skip=st.slider('Process every Nth frame',1,30,10,key='frame_skip')
     with right:
         video=st.file_uploader('Upload maritime video',type=['mp4','avi','mov','mkv'],key='video_upload')
-        if video: st.video(video)
-        process=st.button('▶ Analyse Video',type='primary',use_container_width=True,disabled=video is None)
+        if video:
+            video_size_mb=len(video.getvalue())/(1024*1024)
+            safe_video_name=str(video.name).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+            st.markdown(
+                f'''<div class="panel" style="text-align:center;padding:30px 24px;margin:14px 0 16px 0;">
+                    <div style="font-size:34px;line-height:1;margin-bottom:10px;">🎬</div>
+                    <div style="font-size:19px;font-weight:800;color:#FFFFFF;letter-spacing:.4px;">VIDEO READY FOR ANALYSIS</div>
+                    <div style="margin-top:8px;color:#22D3EE;font-weight:700;">{safe_video_name}</div>
+                    <div style="margin-top:4px;color:#BFD7E3;font-size:13px;">{video_size_mb:.1f} MB • Upload successful</div>
+                    <div style="max-width:650px;margin:14px auto 0 auto;color:#E8F3F8;line-height:1.55;">
+                        Select the detection settings and click <b>Analyse Video</b> to begin YOLO26 Nano vessel detection.
+                        Processed frames will appear in the Live Detection Preview below.
+                    </div>
+                    <div style="margin-top:14px;color:#7DE7F5;font-weight:700;">✓ Ready for YOLO26 Analysis</div>
+                </div>''',
+                unsafe_allow_html=True
+            )
+        process=st.button('▶ Analyse Video',type='primary',width='stretch',disabled=video is None)
     if video and process:
         suffix=os.path.splitext(video.name)[1]
         with tempfile.NamedTemporaryFile(delete=False,suffix=suffix) as f: f.write(video.getvalue()); input_path=f.name
@@ -413,6 +502,17 @@ elif page=='Video Detection':
             fps=cap.get(cv2.CAP_PROP_FPS) or 25; total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)); width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             output_path=tempfile.NamedTemporaryFile(delete=False,suffix='.mp4').name
             writer=cv2.VideoWriter(output_path,cv2.VideoWriter_fourcc(*'mp4v'),fps,(width,height))
+            st.markdown('<div class="section">Live Detection Preview</div>',unsafe_allow_html=True)
+            st.caption('Processed frames are displayed immediately below while Sea Sentinel analyses the uploaded video. This avoids browser video-codec limitations during the live demonstration.')
+            live_left, live_right = st.columns(2, gap='large')
+            with live_left:
+                st.markdown('### Current Original Frame')
+                original_frame_slot = st.empty()
+            with live_right:
+                st.markdown('### Current AI Detection')
+                detected_frame_slot = st.empty()
+                live_result_slot = st.empty()
+
             progress=st.progress(0); status=st.empty(); frame_no=processed=detections=0; confs=[]; class_counts=Counter(); timeline=[]; last_annotated=None
             while True:
                 ok,frame=cap.read()
@@ -421,27 +521,147 @@ elif page=='Video Detection':
                 if frame_no % frame_skip==0:
                     processed+=1; status.text(f'Analysing frame {frame_no+1} / {max(total,1)}')
                     pil=Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
+                    original_frame_slot.image(pil, width=500)
                     try:
                         preds=run_workflow(pil,classes,conf,text_scale,box,box_palette,label_palette); detections+=len(preds)
-                        confs.extend([p.get('confidence',0) for p in preds]); class_counts.update([pretty(p.get('class','unknown')) for p in preds]); timeline.append({'Frame':frame_no+1,'Detections':len(preds)})
-                        last_annotated=draw_detections(pil,preds,box); out_frame=cv2.cvtColor(np.array(last_annotated),cv2.COLOR_RGB2BGR)
-                    except Exception: pass
+                        frame_confs=[float(p.get('confidence',0) or 0) for p in preds]
+                        confs.extend(frame_confs); class_counts.update([pretty(p.get('class','unknown')) for p in preds]); timeline.append({'Frame':frame_no+1,'Detections':len(preds)})
+                        last_annotated=draw_video_detections(pil,preds,max(5,box)); out_frame=cv2.cvtColor(np.array(last_annotated),cv2.COLOR_RGB2BGR)
+                        detected_frame_slot.image(last_annotated, width=500)
+                        st.session_state.video_last_original = pil
+                        st.session_state.video_last_annotated = last_annotated
+                        if preds:
+                            top=max(preds,key=lambda x:float(x.get('confidence',0) or 0))
+                            result_text=f"Frame {frame_no+1}: {len(preds)} detection(s) • Top: {pretty(top.get('class','unknown'))} {float(top.get('confidence',0) or 0)*100:.1f}%"
+                            st.session_state.video_last_result=('success', result_text)
+                            live_result_slot.success(result_text)
+                        else:
+                            result_text=f'Frame {frame_no+1}: No detections above the selected threshold.'
+                            st.session_state.video_last_result=('info', result_text)
+                            live_result_slot.info(result_text)
+                    except Exception as e:
+                        detected_frame_slot.image(pil, width=500)
+                        live_result_slot.warning(f'Frame {frame_no+1}: inference skipped ({e})')
                 writer.write(out_frame); frame_no+=1
                 if total>0: progress.progress(min(frame_no/total,1.0))
             cap.release(); writer.release(); progress.progress(1.0); status.success('Video analysis completed.')
-            with open(output_path,'rb') as f: video_bytes=f.read()
-            st.session_state.video_output=video_bytes; st.session_state.video_stats={'processed':processed,'detections':detections,'avg':float(np.mean(confs)) if confs else 0,'skip':frame_skip,'classes':dict(class_counts),'timeline':timeline}
+            # Convert the OpenCV-generated MP4 to browser-friendly H.264 when FFmpeg is available.
+            # Keep the original OpenCV MP4 as a safe fallback so detection never fails just because
+            # a local FFmpeg installation is unavailable.
+            playback_path = output_path
+            ffmpeg_exe = shutil.which('ffmpeg')
+            if ffmpeg_exe:
+                h264_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+                try:
+                    subprocess.run([
+                        ffmpeg_exe, '-y', '-i', output_path,
+                        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                        '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+                        '-an', h264_path
+                    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if os.path.exists(h264_path) and os.path.getsize(h264_path) > 0:
+                        playback_path = h264_path
+                except Exception:
+                    try:
+                        if os.path.exists(h264_path): os.remove(h264_path)
+                    except Exception:
+                        pass
+
+            with open(playback_path,'rb') as f: video_bytes=f.read()
+            # Store the uploaded bytes too. Streamlit can infer/play the original container directly.
+            st.session_state.video_output=video_bytes; st.session_state.video_original=video.getvalue(); st.session_state.video_original_name=video.name; st.session_state.video_stats={'processed':processed,'detections':detections,'avg':float(np.mean(confs)) if confs else 0,'skip':frame_skip,'classes':dict(class_counts),'timeline':timeline}
             save_history('Video', video.name, threshold=conf, detections=detections, confidences=confs, class_counts=class_counts, details=timeline)
             st.success('Video analysis completed and saved to Detection History.')
     if st.session_state.video_stats:
+        if (not process) and st.session_state.video_last_annotated is not None:
+            st.markdown('<div class="section">Latest Video Detection Result</div>',unsafe_allow_html=True)
+            pleft, pright = st.columns(2, gap='large')
+            with pleft:
+                st.markdown('### Last Original Frame')
+                if st.session_state.video_last_original is not None:
+                    st.image(st.session_state.video_last_original, width=500)
+            with pright:
+                st.markdown('### Last AI Detection')
+                st.image(st.session_state.video_last_annotated, width=500)
+                if st.session_state.video_last_result:
+                    kind, msg = st.session_state.video_last_result
+                    if kind == 'success': st.success(msg)
+                    else: st.info(msg)
         s=st.session_state.video_stats; cols=st.columns(4)
         for c,(n,v) in zip(cols,[('Frames Processed',s['processed']),('Frame Detections',s['detections']),('Average Confidence',f"{s['avg']*100:.1f}%"),('Frame Sampling',f"1/{s['skip']}")]):
             with c:kpi(n,v,'Video analysis')
         if st.session_state.video_output:
-            st.markdown('<div class="section">Annotated Video</div>',unsafe_allow_html=True); st.video(st.session_state.video_output); st.download_button('⬇ Download Detected Video',st.session_state.video_output,'sea_sentinel_video.mp4','video/mp4')
+            st.markdown('<div class="section">Processed Video Export</div>',unsafe_allow_html=True)
+            st.caption('The live frame-by-frame preview above is the primary in-dashboard result. The processed MP4 remains available for export.')
+            st.download_button('⬇ Download Detected Video',st.session_state.video_output,'sea_sentinel_video.mp4','video/mp4',width='stretch')
         if s['timeline']:
-            fig=px.line(pd.DataFrame(s['timeline']),x='Frame',y='Detections',markers=True,title='Detections Across Processed Frames'); st.plotly_chart(transparent(fig,300),use_container_width=True,config={'displayModeBar':False})
+            fig=px.line(pd.DataFrame(s['timeline']),x='Frame',y='Detections',markers=True,title='Detections Across Processed Frames'); st.plotly_chart(transparent(fig,300),width='stretch',config={'displayModeBar':False})
         st.caption('“Frame Detections” counts detections across sampled frames; it is not an estimate of unique physical vessels tracked through the video.')
+
+# ---------------- LIVE DETECTION ----------------
+elif page=='Live Detection':
+    title('Live Vessel Detection','Capture a live webcam feed and run frame-by-frame Sea Sentinel vessel detection.')
+    st.markdown('<div class="panel"><b>Live camera inference</b><br><span class="soft">This page captures frames from a webcam connected to the computer running Sea Sentinel and sends selected frames through the existing YOLO26 Nano Roboflow workflow. The displayed processing rate includes camera capture, network and cloud-inference latency.</span></div>',unsafe_allow_html=True)
+
+    control_col, live_col = st.columns([1,2.5],gap='large')
+    with control_col:
+        st.markdown('<div class="section">Live Configuration</div>',unsafe_allow_html=True)
+        live_classes=st.multiselect('Vessel classes',VESSEL_CLASSES,default=VESSEL_CLASSES,format_func=pretty,key='live_classes')
+        live_conf=st.slider('Confidence threshold',0.10,1.00,0.40,0.05,key='live_conf')
+        live_box=st.slider('Bounding box thickness',1,6,3,key='live_box')
+        camera_index=st.number_input('Camera index',min_value=0,max_value=5,value=0,step=1,key='live_camera_index',help='0 is normally the built-in/default webcam. Try 1 for a USB camera.')
+        live_duration=st.slider('Demo duration (seconds)',5,60,15,5,key='live_duration')
+        inference_every=st.slider('Run AI every Nth camera frame',1,30,5,key='live_every',help='Use 1 for every captured frame. Higher values reduce cloud API calls and may make the preview smoother.')
+        start_live=st.button('🔴 Start Live Detection',type='primary',width='stretch')
+        st.caption('The session stops automatically after the selected duration. This prevents a camera loop from locking the Streamlit page.')
+
+    with live_col:
+        st.markdown('<div class="section">Live Camera Feed</div>',unsafe_allow_html=True)
+        live_frame_slot=st.empty(); live_message_slot=st.empty(); live_metrics_slot=st.empty()
+
+    if start_live:
+        if not live_classes:
+            st.warning('Select at least one vessel class before starting live detection.')
+        else:
+            backend=cv2.CAP_DSHOW if os.name=='nt' else cv2.CAP_ANY
+            cap=cv2.VideoCapture(int(camera_index),backend)
+            if not cap.isOpened():
+                st.error('Unable to open the selected webcam. Close other apps using the camera, confirm camera permission, or try another camera index.')
+            else:
+                started=time.perf_counter(); captured=0; inferred=0; total_detections=0; inference_times=[]; latest_preds=[]
+                try:
+                    while time.perf_counter()-started < live_duration:
+                        ok,frame=cap.read()
+                        if not ok:
+                            live_message_slot.error('Camera frame could not be read.'); break
+                        captured+=1
+                        pil=Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)); display_image=pil
+                        if (captured-1) % inference_every==0:
+                            t0=time.perf_counter()
+                            try:
+                                latest_preds=run_workflow(pil,live_classes,live_conf,0.7,live_box,'ROBOFLOW','Matplotlib Pastel1')
+                                latency=time.perf_counter()-t0; inference_times.append(latency); inferred+=1; total_detections+=len(latest_preds)
+                                display_image=draw_detections(pil,latest_preds,live_box)
+                                if latest_preds:
+                                    top=max(latest_preds,key=lambda x:float(x.get('confidence',0) or 0))
+                                    live_message_slot.success(f"● LIVE • {len(latest_preds)} detection(s) • Top: {pretty(top.get('class','unknown'))} {float(top.get('confidence',0) or 0)*100:.1f}%")
+                                else: live_message_slot.info('● LIVE • No detections above the selected threshold.')
+                            except Exception as e:
+                                live_message_slot.warning(f'Live inference request failed: {e}')
+                        elif latest_preds:
+                            display_image=draw_detections(pil,latest_preds,live_box)
+                        live_frame_slot.image(display_image,width='stretch',channels='RGB')
+                        elapsed=max(time.perf_counter()-started,0.001); observed_rate=inferred/elapsed; avg_latency=float(np.mean(inference_times))*1000 if inference_times else 0.0
+                        live_metrics_slot.markdown(f'<div class="panel"><b>● LIVE CAMERA</b> &nbsp; | &nbsp; AI Frames: <b>{inferred}</b> &nbsp; | &nbsp; Detections: <b>{total_detections}</b> &nbsp; | &nbsp; Avg Inference: <b>{avg_latency:.0f} ms</b> &nbsp; | &nbsp; Observed AI Rate: <b>{observed_rate:.2f} FPS</b></div>',unsafe_allow_html=True)
+                finally:
+                    cap.release()
+                elapsed=max(time.perf_counter()-started,0.001); observed_rate=inferred/elapsed; avg_latency=float(np.mean(inference_times))*1000 if inference_times else 0.0
+                live_message_slot.success(f'Live detection session completed after {elapsed:.1f} seconds.')
+                m=st.columns(4)
+                values=[('AI Frames',inferred,'Frames submitted for inference'),('Frame Detections',total_detections,'Across inferred frames'),('Avg Inference Latency',f'{avg_latency:.0f} ms','Includes network/cloud latency'),('Observed AI Rate',f'{observed_rate:.2f} FPS','Measured during this session')]
+                for c,(n,v,note) in zip(m,values):
+                    with c:kpi(n,v,note)
+                st.caption('Live Detection currently uses the Roboflow serverless workflow, so it requires internet access. The FPS value is the observed end-to-end AI processing rate, not the webcam hardware frame rate.')
 
 # ---------------- DETECTION ANALYTICS ----------------
 elif page=='Detection Analytics':
@@ -458,7 +678,7 @@ elif page=='Detection Analytics':
         c1,c2=st.columns([1.35,1],gap='large')
         with c1:
             fig=px.line(chart_df,x='timestamp',y='detections',markers=True,color='source_type',title='Detection Activity Over Time',labels={'timestamp':'Date / Time','detections':'Detections','source_type':'Source'})
-            st.plotly_chart(transparent(fig,330),use_container_width=True,config={'displayModeBar':False})
+            st.plotly_chart(transparent(fig,330),width='stretch',config={'displayModeBar':False})
         with c2:
             agg=Counter()
             for raw in hist['class_counts'].fillna('{}'):
@@ -467,7 +687,7 @@ elif page=='Detection Analytics':
             if agg:
                 cc=pd.DataFrame({'Vessel Type':list(agg.keys()),'Detections':list(agg.values())})
                 fig=px.pie(cc,names='Vessel Type',values='Detections',hole=.58,title='Historical Vessel Distribution')
-                st.plotly_chart(transparent(fig,330),use_container_width=True,config={'displayModeBar':False})
+                st.plotly_chart(transparent(fig,330),width='stretch',config={'displayModeBar':False})
             else: st.info('Class-level history will appear after detections are recorded.')
         st.markdown('<div class="section">Saved Detection History</div>',unsafe_allow_html=True)
         display=hist[['timestamp','source_type','filename','detections','avg_confidence','max_confidence','vessel_types','threshold']].copy()
@@ -476,7 +696,7 @@ elif page=='Detection Analytics':
         display['max_confidence']=(display['max_confidence']*100).round(1).astype(str)+'%'
         display['threshold']=(display['threshold']*100).round(0).astype(int).astype(str)+'%'
         display.columns=['Date / Time','Source','File','Detections','Avg Confidence','Highest Confidence','Vessel Types','Threshold']
-        st.dataframe(display,use_container_width=True,hide_index=True)
+        st.dataframe(display,width='stretch',hide_index=True)
         st.download_button('⬇ Export History CSV',display.to_csv(index=False).encode('utf-8'),'sea_sentinel_detection_history.csv','text/csv')
         with st.expander('History management'):
             st.warning('Clearing history permanently deletes the locally stored detection records.')
@@ -488,7 +708,7 @@ elif page=='Detection Analytics':
         st.markdown('<div class="section">Latest Image Detection Details</div>',unsafe_allow_html=True)
         rows=[]
         for i,p in enumerate(preds,1): rows.append({'#':i,'Vessel Type':pretty(p.get('class','unknown')),'Confidence (%)':round(p.get('confidence',0)*100,1),'X':round(p.get('x',0),1),'Y':round(p.get('y',0),1),'Width':round(p.get('width',0),1),'Height':round(p.get('height',0),1)})
-        st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+        st.dataframe(pd.DataFrame(rows),width='stretch',hide_index=True)
 
 # ---------------- DATASET ----------------
 elif page=='Dataset Analytics':
@@ -498,9 +718,9 @@ elif page=='Dataset Analytics':
         with c:kpi(n,v,'Dataset composition')
     c1,c2=st.columns([1.4,1],gap='large')
     with c1:
-        df=pd.DataFrame({'Vessel':DATASET_COUNTS.keys(),'Images':DATASET_COUNTS.values()}); fig=px.bar(df,x='Vessel',y='Images',text='Images',title='Class Distribution'); fig.update_traces(textposition='outside'); st.plotly_chart(transparent(fig),use_container_width=True,config={'displayModeBar':False})
+        df=pd.DataFrame({'Vessel':DATASET_COUNTS.keys(),'Images':DATASET_COUNTS.values()}); fig=px.bar(df,x='Vessel',y='Images',text='Images',title='Class Distribution'); fig.update_traces(textposition='outside'); st.plotly_chart(transparent(fig),width='stretch',config={'displayModeBar':False})
     with c2:
-        split=pd.DataFrame({'Split':['Training','Validation','Testing'],'Images':[1569,403,269]}); fig=px.pie(split,names='Split',values='Images',hole=.62,title='Dataset Split'); st.plotly_chart(transparent(fig),use_container_width=True,config={'displayModeBar':False})
+        split=pd.DataFrame({'Split':['Training','Validation','Testing'],'Images':[1569,403,269]}); fig=px.pie(split,names='Split',values='Images',hole=.62,title='Dataset Split'); st.plotly_chart(transparent(fig),width='stretch',config={'displayModeBar':False})
         st.caption('The displayed split is 1,569 training, 403 validation and 269 testing images.')
 
 # ---------------- MODEL ----------------
@@ -509,8 +729,145 @@ elif page=='Model Performance':
     cols=st.columns(4)
     for c,(n,v) in zip(cols,MODEL.items()):
         with c:kpi(n,f'{v:.1f}%','Validation metric')
-    df=pd.DataFrame({'Class':CLASS_MAP50.keys(),'mAP@50 (%)':CLASS_MAP50.values()}); fig=px.bar(df,x='mAP@50 (%)',y='Class',orientation='h',text='mAP@50 (%)',title='Per-Class Performance'); fig.update_xaxes(range=[0,100]); st.plotly_chart(transparent(fig,420),use_container_width=True,config={'displayModeBar':False})
-    st.info('Model-performance values on this page are project-level evaluation metrics. Live image/video confidence values are kept separate on the detection pages.')
+    df=pd.DataFrame({'Class':CLASS_MAP50.keys(),'mAP@50 (%)':CLASS_MAP50.values()})
+    fig=px.bar(df,x='mAP@50 (%)',y='Class',orientation='h',text='mAP@50 (%)',title='Per-Class Performance')
+    fig.update_xaxes(range=[0,100])
+    st.plotly_chart(transparent(fig,420),width='stretch',config={'displayModeBar':False})
+    st.info('Model-performance values above are project-level evaluation metrics. Live image/video confidence values are kept separate on the detection pages.')
+
+    st.markdown('<div class="section">Model Resilience to Visual Degradation</div>',unsafe_allow_html=True)
+    st.markdown('''<div class="panel"><b>Controlled resilience test</b><br><span class="soft">Upload one maritime test image, create a degraded copy, and process both versions using the same YOLO26 Nano workflow. This test does not retrain or modify the model. Results below are live inference results, not dataset-level validation metrics.</span></div>''',unsafe_allow_html=True)
+
+    control_col, preview_col = st.columns([1,2.25],gap='large')
+    with control_col:
+        resilience_upload=st.file_uploader('Upload resilience test image',type=['jpg','jpeg','png'],key='resilience_upload')
+        degradation=st.selectbox('Visual degradation',['Gaussian Noise','Blur','Low Light','Fog / Haze'],key='resilience_degradation')
+        severity=st.slider('Degradation severity',1,5,3,key='resilience_severity',help='1 = mild, 5 = severe')
+        severity_name={1:'Mild',2:'Mild–Moderate',3:'Moderate',4:'Strong',5:'Severe'}[severity]
+        st.caption(f'Selected severity: {severity_name}')
+        resilience_conf=st.slider('Inference confidence threshold',0.10,1.00,0.40,0.05,key='resilience_conf')
+        run_resilience=st.button('🧪 Run Resilience Test',type='primary',width='stretch',disabled=resilience_upload is None)
+
+    if resilience_upload is not None:
+        original_resilience=Image.open(resilience_upload).convert('RGB')
+        degraded_resilience=apply_visual_degradation(original_resilience,degradation,severity)
+        with preview_col:
+            p1,p2=st.columns(2)
+            with p1:
+                st.markdown('<div class="section">Original Preview</div>',unsafe_allow_html=True)
+                st.image(original_resilience,width='stretch')
+            with p2:
+                st.markdown(f'<div class="section">{degradation} Preview</div>',unsafe_allow_html=True)
+                st.image(degraded_resilience,width='stretch')
+
+        if run_resilience:
+            with st.spinner('Running the same YOLO26 Nano workflow on the original and degraded images...'):
+                try:
+                    original_preds=run_workflow(original_resilience,VESSEL_CLASSES,resilience_conf,0.7,3,'ROBOFLOW','Matplotlib Pastel1')
+                    degraded_preds=run_workflow(degraded_resilience,VESSEL_CLASSES,resilience_conf,0.7,3,'ROBOFLOW','Matplotlib Pastel1')
+                    st.session_state.resilience_result={
+                        'filename':resilience_upload.name,
+                        'degradation':degradation,
+                        'severity':severity,
+                        'severity_name':severity_name,
+                        'threshold':resilience_conf,
+                        'original_image':original_resilience,
+                        'degraded_image':degraded_resilience,
+                        'original_preds':original_preds,
+                        'degraded_preds':degraded_preds
+                    }
+                    st.success('Resilience test completed. Results are shown below and are not added to Detection History.')
+                except Exception as e:
+                    st.error(f'Resilience test workflow error: {e}')
+
+    rr=st.session_state.resilience_result
+    if rr:
+        st.markdown('<div class="section">Resilience Test Results</div>',unsafe_allow_html=True)
+        osum=summarize_predictions(rr['original_preds']); dsum=summarize_predictions(rr['degraded_preds'])
+        original_annotated=draw_detections(rr['original_image'],rr['original_preds'],3)
+        degraded_annotated=draw_detections(rr['degraded_image'],rr['degraded_preds'],3)
+        r1,r2=st.columns(2,gap='large')
+        with r1:
+            st.markdown('### Original Image')
+            st.image(original_annotated,width='stretch')
+            st.caption(f"Top prediction: {osum['top_class']} • {osum['top_confidence']*100:.1f}% confidence")
+        with r2:
+            st.markdown(f"### {rr['degradation']} · {rr['severity_name']}")
+            st.image(degraded_annotated,width='stretch')
+            st.caption(f"Top prediction: {dsum['top_class']} • {dsum['top_confidence']*100:.1f}% confidence")
+
+        # Use the displayed one-decimal confidence values for a visually consistent change value.
+        original_top_pct=round(osum['top_confidence']*100,1)
+        degraded_top_pct=round(dsum['top_confidence']*100,1)
+        confidence_change=round(degraded_top_pct-original_top_pct,1)
+        detection_change=dsum['detections']-osum['detections']
+        same_class=osum['top_class']==dsum['top_class'] and osum['top_class']!='No Detection'
+        metrics=st.columns(5)
+        result_metrics=[
+            ('Original Top Confidence',f"{original_top_pct:.1f}%",osum['top_class']),
+            ('Degraded Top Confidence',f"{degraded_top_pct:.1f}%",dsum['top_class']),
+            ('Confidence Change',f"{confidence_change:+.1f} pp",f"{rr['degradation']} · {rr['severity_name']}"),
+            ('Detection Count Change',f"{detection_change:+d}",f"{osum['detections']} → {dsum['detections']} detections"),
+            ('Top Class Retained','Yes' if same_class else 'No','Original vs degraded')
+        ]
+        for c,(n,v,note) in zip(metrics,result_metrics):
+            with c:kpi(n,v,note)
+
+        comparison=pd.DataFrame({
+            'Condition':['Original',f"{rr['degradation']} ({rr['severity_name']})"],
+            'Top Class':[osum['top_class'],dsum['top_class']],
+            'Top Conf. (%)':[original_top_pct,degraded_top_pct],
+            'Detections':[osum['detections'],dsum['detections']],
+            'Avg Conf. (%)':[round(osum['avg_confidence']*100,1),round(dsum['avg_confidence']*100,1)]
+        })
+        st.markdown('<div class="section">Prediction Comparison</div>',unsafe_allow_html=True)
+        st.dataframe(comparison,width='stretch',hide_index=True,column_config={
+            'Condition':st.column_config.TextColumn('Image Condition',width='medium'),
+            'Top Class':st.column_config.TextColumn('Top Class',width='medium'),
+            'Top Conf. (%)':st.column_config.NumberColumn('Top Confidence (%)',format='%.1f'),
+            'Detections':st.column_config.NumberColumn('Detections',format='%d'),
+            'Avg Conf. (%)':st.column_config.NumberColumn('Average Confidence (%)',format='%.1f')
+        })
+
+        def prediction_rows(predictions):
+            ordered=sorted(predictions or [],key=lambda x:float(x.get('confidence',0) or 0),reverse=True)
+            return pd.DataFrame([{
+                '#':i,
+                'Detected Class':pretty(pred.get('class','unknown')),
+                'Confidence (%)':round(float(pred.get('confidence',0) or 0)*100,1)
+            } for i,pred in enumerate(ordered,1)])
+
+        st.markdown('<div class="section">All Detected Classes</div>',unsafe_allow_html=True)
+        dleft,dright=st.columns(2,gap='large')
+        for col,label,preds in [
+            (dleft,'Original Image Detections',rr['original_preds']),
+            (dright,f"{rr['degradation']} · {rr['severity_name']} Detections",rr['degraded_preds'])
+        ]:
+            with col:
+                st.markdown(f'**{label}**')
+                detail_df=prediction_rows(preds)
+                if detail_df.empty:
+                    st.info('No detections above the selected confidence threshold.')
+                else:
+                    st.dataframe(detail_df,width='stretch',hide_index=True,column_config={
+                        '#':st.column_config.NumberColumn('#',format='%d',width='small'),
+                        'Detected Class':st.column_config.TextColumn('Detected Class',width='medium'),
+                        'Confidence (%)':st.column_config.NumberColumn('Confidence (%)',format='%.1f')
+                    })
+
+        chart_df=comparison[['Condition','Top Conf. (%)']].copy()
+        fig=px.bar(chart_df,x='Condition',y='Top Conf. (%)',text='Top Conf. (%)',title='Top Detection Confidence')
+        fig.update_yaxes(range=[0,100],title='Top Detection Confidence (%)')
+        fig.update_xaxes(title='Image Condition')
+        fig.update_traces(texttemplate='%{text:.1f}%',textposition='outside')
+        st.plotly_chart(transparent(fig,340),width='stretch',config={'displayModeBar':False})
+
+        if detection_change>0:
+            st.warning(f"The degraded image produced {detection_change} additional detection(s). Review the 'All Detected Classes' table above; degradation can introduce additional predictions and they should not automatically be treated as additional physical vessels.")
+        elif detection_change<0:
+            st.warning(f"The degraded image produced {abs(detection_change)} fewer detection(s) than the original image.")
+
+        st.caption('Interpretation note: this is a controlled single-image resilience comparison. It does not by itself establish overall model robustness. Aggregate resilience claims should be based on multiple test images and conditions.')
 
 # ---------------- METHOD ----------------
 elif page=='Methodology':
