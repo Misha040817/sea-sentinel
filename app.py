@@ -337,14 +337,14 @@ def prediction_detail_df(predictions):
                      'Width':round(float(p.get('width',0) or 0),1),'Height':round(float(p.get('height',0) or 0),1)})
     return pd.DataFrame(rows)
 
-def show_detection_results(predictions, heading='Detection Results', image_page=False):
+def show_detection_results(predictions, heading='Detection Results', image_page=False, clean_table=False):
     st.markdown(f'<div class="section">{heading}</div>',unsafe_allow_html=True)
     df=prediction_detail_df(predictions)
     if df.empty:
         st.info('No detections above the selected confidence threshold.')
     else:
-        if image_page:
-            # Image Detection only: use a clean HTML table so Streamlit's
+        if image_page or clean_table:
+            # Clean HTML table avoids Streamlit dataframe bottom/focus underline.
             # dataframe cyan bottom/focus line cannot appear.
             display_df=df.copy()
             display_df['Confidence (%)']=display_df['Confidence (%)'].map(lambda v: f'{v:.1f}')
@@ -1010,9 +1010,9 @@ elif page=='Model Performance':
         st.markdown('<div class="section">Technical Detection Results</div>',unsafe_allow_html=True)
         tleft,tright=st.columns(2,gap='large')
         with tleft:
-            show_detection_results(rr['original_preds'],'Original Detection Results')
+            show_detection_results(rr['original_preds'],'Original Detection Results',clean_table=True)
         with tright:
-            show_detection_results(rr['degraded_preds'],f"{rr['degradation']} Detection Results")
+            show_detection_results(rr['degraded_preds'],f"{rr['degradation']} Detection Results",clean_table=True)
 
         chart_df=comparison[['Condition','Top Conf. (%)']].copy()
         fig=px.bar(chart_df,x='Condition',y='Top Conf. (%)',text='Top Conf. (%)',title='Top Detection Confidence')
