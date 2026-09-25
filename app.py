@@ -1,4 +1,4 @@
-import os, io, cv2, tempfile, base64, sqlite3, json, subprocess, shutil, time
+import os, io, cv2, tempfile, base64, sqlite3, json, subprocess, shutil, time, html
 from datetime import datetime
 from collections import Counter
 import numpy as np
@@ -169,13 +169,71 @@ html, body, [class*="css"] { color:#F4FAFD !important; }
 .stApp [data-testid="stMarkdownContainer"] h1,.stApp [data-testid="stMarkdownContainer"] h2,.stApp [data-testid="stMarkdownContainer"] h3,.stApp [data-testid="stMarkdownContainer"] h4{color:#FFFFFF!important;-webkit-text-fill-color:#FFFFFF!important}
 /* Stronger input outlines */
 [data-baseweb="select"]>div,[data-testid="stTextInput"] input,[data-testid="stNumberInput"] input{border:2px solid rgba(83,142,171,.45)!important}
+/* Raw prediction output: force Sea Sentinel dark theme and readable JSON */
+[data-testid="stCodeBlock"]{background:#071827!important;border:2px solid rgba(34,211,238,.46)!important;border-radius:12px!important;overflow:hidden!important}
+[data-testid="stCodeBlock"] pre,[data-testid="stCodeBlock"] code,[data-testid="stCodeBlock"] span{background:#071827!important;color:#EAF6FB!important;-webkit-text-fill-color:#EAF6FB!important;opacity:1!important}
 
 </style>''', unsafe_allow_html=True)
+
+st.markdown('''
+<style>
+/* FINAL: make expander header/label clearly visible */
+[data-testid="stExpander"] summary,
+[data-testid="stExpander"] summary *,
+[data-testid="stExpander"] summary p,
+[data-testid="stExpander"] summary span {
+    color:#FFFFFF !important;
+    -webkit-text-fill-color:#FFFFFF !important;
+    opacity:1 !important;
+    font-weight:800 !important;
+}
+[data-testid="stExpander"] summary {
+    background:#173247 !important;
+}
+</style>
+''', unsafe_allow_html=True)
+
+
+st.markdown('''
+<style>
+/* === RAW PREDICTION OUTPUT: HIGH-CONTRAST LIGHT VIEWER === */
+[data-testid="stJson"],
+[data-testid="stJson"] > div,
+[data-testid="stJson"] pre,
+[data-testid="stJson"] code,
+[data-testid="stJson"] span,
+[data-testid="stJson"] div,
+[data-testid="stJson"] button,
+[data-testid="stJson"] svg,
+[data-testid="stCode"],
+[data-testid="stCode"] pre,
+[data-testid="stCode"] code,
+[data-testid="stCode"] span,
+[data-testid="stCode"] div,
+[data-testid="stCodeBlock"],
+[data-testid="stCodeBlock"] pre,
+[data-testid="stCodeBlock"] code,
+[data-testid="stCodeBlock"] span {
+    color:#071827 !important;
+    -webkit-text-fill-color:#071827 !important;
+    opacity:1 !important;
+}
+[data-testid="stJson"] pre,
+[data-testid="stJson"] code,
+[data-testid="stCode"] pre,
+[data-testid="stCode"] code,
+[data-testid="stCodeBlock"] pre,
+[data-testid="stCodeBlock"] code {
+    background:#F7FAFC !important;
+}
+</style>
+''', unsafe_allow_html=True)
+
 
 # ---------------- STATE ----------------
 for key, default in {
     'image_predictions':[], 'image_obj':None, 'image_name':None, 'history':[],
-    'video_stats':None, 'video_output':None, 'video_original':None, 'video_original_name':None, 'video_last_original':None, 'video_last_annotated':None, 'video_last_result':None, 'resilience_result':None
+    'video_stats':None, 'video_output':None, 'video_original':None, 'video_original_name':None, 'video_last_original':None, 'video_last_annotated':None, 'video_last_result':None, 'video_last_predictions':[], 'live_last_predictions':[], 'resilience_result':None
 }.items():
     if key not in st.session_state: st.session_state[key] = default
 
@@ -243,11 +301,71 @@ def get_client():
         st.error('ROBOFLOW_API_KEY is missing. Add it to .env locally or Streamlit Secrets when deployed.')
         st.stop()
     return InferenceHTTPClient(api_url='https://serverless.roboflow.com', api_key=key)
-def run_workflow(image, classes, confidence, text_scale, box_thickness, box_palette, label_palette):
+def box_iou(a, b):
+    """IoU for Roboflow center-format boxes (x, y, width, height)."""
+    def corners(p):
+        x=float(p.get('x',0) or 0); y=float(p.get('y',0) or 0)
+        w=float(p.get('width',0) or 0); h=float(p.get('height',0) or 0)
+        return x-w/2, y-h/2, x+w/2, y+h/2
+    ax1,ay1,ax2,ay2=corners(a); bx1,by1,bx2,by2=corners(b)
+    iw=max(0.0,min(ax2,bx2)-max(ax1,bx1)); ih=max(0.0,min(ay2,by2)-max(ay1,by1))
+    inter=iw*ih; union=max(0.0,(ax2-ax1)*(ay2-ay1))+max(0.0,(bx2-bx1)*(by2-by1))-inter
+    return inter/union if union>0 else 0.0
+
+def apply_nms(predictions, iou_threshold=0.30):
+    """Class-aware NMS so the displayed IoU threshold is a real post-processing control."""
+    ordered=sorted(predictions or [],key=lambda p:float(p.get('confidence',0) or 0),reverse=True)
+    kept=[]
+    for pred in ordered:
+        cls=str(pred.get('class',''))
+        if all(str(k.get('class',''))!=cls or box_iou(pred,k)<=iou_threshold for k in kept):
+            kept.append(pred)
+    return kept
+
+def run_workflow(image, classes, confidence, iou_threshold, text_scale, box_thickness, box_palette, label_palette):
     result = get_client().run_workflow(workspace_name=WORKSPACE,workflow_id=WORKFLOW_ID,images={'image':image},parameters={
         'class_filter':classes,'text_scale':text_scale,'text_color':'Black','confidence':confidence,'text_thickness':1,
         'text_position':'CENTER','bounding_box_thickness':box_thickness,'bounding_box_color_palette':box_palette,'label_color_palette':label_palette})
-    return result[0].get('predictions',{}).get('predictions',[])
+    predictions=result[0].get('predictions',{}).get('predictions',[])
+    return apply_nms(predictions,iou_threshold)
+
+def prediction_detail_df(predictions):
+    rows=[]
+    for i,p in enumerate(predictions or [],1):
+        rows.append({'#':i,'Class':pretty(p.get('class','unknown')),'Confidence (%)':round(float(p.get('confidence',0) or 0)*100,1),
+                     'X':round(float(p.get('x',0) or 0),1),'Y':round(float(p.get('y',0) or 0),1),
+                     'Width':round(float(p.get('width',0) or 0),1),'Height':round(float(p.get('height',0) or 0),1)})
+    return pd.DataFrame(rows)
+
+def show_detection_results(predictions, heading='Detection Results', image_page=False):
+    st.markdown(f'<div class="section">{heading}</div>',unsafe_allow_html=True)
+    df=prediction_detail_df(predictions)
+    if df.empty:
+        st.info('No detections above the selected confidence threshold.')
+    else:
+        if image_page:
+            # Image Detection only: use a clean HTML table so Streamlit's
+            # dataframe cyan bottom/focus line cannot appear.
+            display_df=df.copy()
+            display_df['Confidence (%)']=display_df['Confidence (%)'].map(lambda v: f'{v:.1f}')
+            for col in ['X','Y','Width','Height']:
+                display_df[col]=display_df[col].map(lambda v: f'{v:g}' if isinstance(v,(int,float,np.integer,np.floating)) else v)
+            table_html=display_df.to_html(index=False,escape=True,classes='image-results-clean-table')
+            image_table_html = '''<style>
+.image-results-table-wrap{width:100%;overflow:hidden;border:1px solid #B8CBD5;border-radius:10px;background:#FFFFFF;margin:0;padding:0;box-shadow:none}
+table.image-results-clean-table{width:100%;border-collapse:collapse;border-spacing:0;margin:0!important;background:#FFFFFF;color:#243746!important;font-size:14px}
+table.image-results-clean-table thead th{background:#F4F6F8!important;color:#6B7280!important;-webkit-text-fill-color:#6B7280!important;text-align:left;font-weight:500;padding:11px 10px;border-right:1px solid #E1E5E9;border-bottom:1px solid #DDE3E7}
+table.image-results-clean-table tbody td{background:#FFFFFF!important;color:#374151!important;-webkit-text-fill-color:#374151!important;padding:11px 10px;border-right:1px solid #E5E7EB;border-bottom:0!important;vertical-align:middle}
+table.image-results-clean-table th:last-child,table.image-results-clean-table td:last-child{border-right:0}
+table.image-results-clean-table tbody tr:last-child td{border-bottom:0!important}
+table.image-results-clean-table th:first-child,table.image-results-clean-table td:first-child{text-align:right;width:9%}
+table.image-results-clean-table td:nth-child(n+3){text-align:right}
+</style><div class="image-results-table-wrap">''' + table_html + '''</div>'''
+            st.html(image_table_html)
+        else:
+            st.dataframe(df,width='stretch',hide_index=True)
+        with st.expander('Raw Prediction Output'):
+            readable_json(predictions)
 def draw_detections(image,predictions,thickness=3):
     out=image.copy(); draw=ImageDraw.Draw(out)
     try: font=ImageFont.truetype('arial.ttf',20)
@@ -290,6 +408,32 @@ def draw_video_detections(image, predictions, thickness=6):
         draw.rounded_rectangle([lx,ly,lx+label_w,ly+label_h],radius=5,fill='#061827',outline='#22D3EE',width=2)
         draw.text((lx+pad_x,ly+pad_y),label,fill='#FFFFFF',font=font)
     return out
+
+
+def readable_json(data):
+    """Render JSON vertically with guaranteed line breaks and indentation."""
+    raw = json.dumps(data, indent=4, default=str)
+    safe = html.escape(raw)
+    safe = safe.replace(" ", "&nbsp;").replace("\\n", "<br>")
+
+    st.markdown(
+        f"""<div style="
+            background:#071827;
+            border:2px solid #22D3EE;
+            border-radius:12px;
+            padding:18px 20px;
+            box-shadow:0 0 16px rgba(34,211,238,.08);
+            overflow-x:auto;
+            color:#FFFFFF !important;
+            -webkit-text-fill-color:#FFFFFF !important;
+            font-family:Consolas,'Courier New',monospace;
+            font-size:14px;
+            line-height:1.65;
+            font-weight:600;
+        ">{safe}</div>""",
+        unsafe_allow_html=True
+    )
+
 
 # ---------------- MODEL RESILIENCE HELPERS ----------------
 def apply_visual_degradation(image, degradation, severity):
@@ -399,11 +543,12 @@ init_db()
 def detection_controls(prefix='img'):
     classes=st.multiselect('Vessel classes',VESSEL_CLASSES,default=VESSEL_CLASSES,format_func=pretty,key=f'{prefix}_classes')
     confidence=st.slider('Confidence threshold',0.10,1.00,0.40,0.05,key=f'{prefix}_conf')
+    iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key=f'{prefix}_iou',help='Class-aware non-maximum suppression threshold for overlapping detections. Lower values suppress overlapping boxes more aggressively.')
     box=st.slider('Bounding box thickness',1,6,3,key=f'{prefix}_box')
     text=st.slider('Text scale',0.5,2.0,0.7,0.1,key=f'{prefix}_text')
     label=st.selectbox('Label color palette',['Matplotlib Pastel1','Matplotlib Set1','Matplotlib Tab10'],key=f'{prefix}_label')
     palette=st.selectbox('Bounding box palette',['ROBOFLOW','Matplotlib Cividis'],key=f'{prefix}_palette')
-    return classes,confidence,box,text,label,palette
+    return classes,confidence,iou,box,text,label,palette
 
 # ---------------- SIDEBAR ----------------
 with st.sidebar:
@@ -438,11 +583,27 @@ if page=='Dashboard':
 
 # ---------------- IMAGE ----------------
 elif page=='Image Detection':
+    st.markdown('''<style>
+    /* Image Detection only: make image toolbar / zoom-fullscreen controls visible */
+    [data-testid="stImage"] [data-testid="stElementToolbar"] button,
+    [data-testid="stImage"] [data-testid="stElementToolbar"] button *,
+    [data-testid="stImage"] [data-testid="stElementToolbar"] svg{
+        color:#071827!important;
+        stroke:#071827!important;
+        fill:#071827!important;
+        opacity:1!important;
+    }
+    [data-testid="stImage"] [data-testid="stElementToolbar"] button{
+        background:#EAF6FB!important;
+        border:1px solid #9FC7D8!important;
+        border-radius:7px!important;
+    }
+    </style>''',unsafe_allow_html=True)
     title('Image Vessel Detection','Upload a maritime image and inspect AI detections in real time.')
     settings,result_area=st.columns([1,3],gap='large')
     with settings:
         st.markdown('<div class="section">Detection Configuration</div>',unsafe_allow_html=True)
-        classes,conf,box,text_scale,label_palette,box_palette=detection_controls('img')
+        classes,conf,iou,box,text_scale,label_palette,box_palette=detection_controls('img')
     with result_area:
         upload=st.file_uploader('Upload maritime image',type=['jpg','jpeg','png'],key='image_upload')
         if upload:
@@ -450,7 +611,7 @@ elif page=='Image Detection':
             if st.button('🚀 Run Object Detection',type='primary',width='stretch'):
                 with st.spinner('Sea Sentinel is analysing the image...'):
                     try:
-                        preds=run_workflow(image,classes,conf,text_scale,box,box_palette,label_palette)
+                        preds=run_workflow(image,classes,conf,iou,text_scale,box,box_palette,label_palette)
                         st.session_state.image_predictions=preds; st.session_state.image_obj=image; st.session_state.image_name=upload.name
                         save_history('Image', upload.name, predictions=preds, threshold=conf)
                         st.success('Detection completed and saved to Detection History.')
@@ -461,9 +622,10 @@ elif page=='Image Detection':
             with a: st.markdown('<div class="section">Input</div>',unsafe_allow_html=True); st.image(image,width='stretch')
             with b: st.markdown('<div class="section">Output</div>',unsafe_allow_html=True); st.image(annotated,width='stretch'); st.download_button('⬇ Download Detected Image',png_bytes(annotated),'sea_sentinel_detection.png','image/png',width='stretch')
             confidences=[p.get('confidence',0) for p in preds]; classes_found=[pretty(p.get('class','unknown')) for p in preds]
-            metrics=st.columns(4); vals=[('Vessels Detected',len(preds)),('Average Confidence',f'{np.mean(confidences)*100:.1f}%' if confidences else '0.0%'),('Vessel Types',len(set(classes_found))),('Highest Confidence',f'{max(confidences)*100:.1f}%' if confidences else '0.0%')]
+            metrics=st.columns(3); vals=[('Vessels Detected',len(preds)),('Vessel Types',len(set(classes_found))),('Highest Confidence',f'{max(confidences)*100:.1f}%' if confidences else '0.0%')]
             for c,(n,v) in zip(metrics,vals):
                 with c:kpi(n,v,'Current uploaded image')
+            show_detection_results(preds,'Detection Results',image_page=True)
     history_preview(6, 'Recent Saved Detections')
 
 # ---------------- VIDEO ----------------
@@ -471,7 +633,7 @@ elif page=='Video Detection':
     title('Video Vessel Detection','Analyse maritime video frames using the same Sea Sentinel detection workflow.')
     left,right=st.columns([1,2.5],gap='large')
     with left:
-        classes,conf,box,text_scale,label_palette,box_palette=detection_controls('vid')
+        classes,conf,iou,box,text_scale,label_palette,box_palette=detection_controls('vid')
         frame_skip=st.slider('Process every Nth frame',1,30,10,key='frame_skip')
     with right:
         video=st.file_uploader('Upload maritime video',type=['mp4','avi','mov','mkv'],key='video_upload')
@@ -523,13 +685,14 @@ elif page=='Video Detection':
                     pil=Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
                     original_frame_slot.image(pil, width=500)
                     try:
-                        preds=run_workflow(pil,classes,conf,text_scale,box,box_palette,label_palette); detections+=len(preds)
+                        preds=run_workflow(pil,classes,conf,iou,text_scale,box,box_palette,label_palette); detections+=len(preds)
                         frame_confs=[float(p.get('confidence',0) or 0) for p in preds]
                         confs.extend(frame_confs); class_counts.update([pretty(p.get('class','unknown')) for p in preds]); timeline.append({'Frame':frame_no+1,'Detections':len(preds)})
                         last_annotated=draw_video_detections(pil,preds,max(5,box)); out_frame=cv2.cvtColor(np.array(last_annotated),cv2.COLOR_RGB2BGR)
                         detected_frame_slot.image(last_annotated, width=500)
                         st.session_state.video_last_original = pil
                         st.session_state.video_last_annotated = last_annotated
+                        st.session_state.video_last_predictions = preds
                         if preds:
                             top=max(preds,key=lambda x:float(x.get('confidence',0) or 0))
                             result_text=f"Frame {frame_no+1}: {len(preds)} detection(s) • Top: {pretty(top.get('class','unknown'))} {float(top.get('confidence',0) or 0)*100:.1f}%"
@@ -569,7 +732,7 @@ elif page=='Video Detection':
 
             with open(playback_path,'rb') as f: video_bytes=f.read()
             # Store the uploaded bytes too. Streamlit can infer/play the original container directly.
-            st.session_state.video_output=video_bytes; st.session_state.video_original=video.getvalue(); st.session_state.video_original_name=video.name; st.session_state.video_stats={'processed':processed,'detections':detections,'avg':float(np.mean(confs)) if confs else 0,'skip':frame_skip,'classes':dict(class_counts),'timeline':timeline}
+            st.session_state.video_output=video_bytes; st.session_state.video_original=video.getvalue(); st.session_state.video_original_name=video.name; st.session_state.video_stats={'processed':processed,'detections':detections,'avg':float(np.mean(confs)) if confs else 0,'latest_conf':(max([float(p.get('confidence',0) or 0) for p in st.session_state.video_last_predictions],default=0.0) if st.session_state.video_last_predictions else 0.0),'skip':frame_skip,'classes':dict(class_counts),'timeline':timeline}
             save_history('Video', video.name, threshold=conf, detections=detections, confidences=confs, class_counts=class_counts, details=timeline)
             st.success('Video analysis completed and saved to Detection History.')
     if st.session_state.video_stats:
@@ -588,15 +751,17 @@ elif page=='Video Detection':
                     if kind == 'success': st.success(msg)
                     else: st.info(msg)
         s=st.session_state.video_stats; cols=st.columns(4)
-        for c,(n,v) in zip(cols,[('Frames Processed',s['processed']),('Frame Detections',s['detections']),('Average Confidence',f"{s['avg']*100:.1f}%"),('Frame Sampling',f"1/{s['skip']}")]):
-            with c:kpi(n,v,'Video analysis')
+        detection_conf=s.get('latest_conf',s.get('avg',0))
+        for c,(n,v,sub) in zip(cols,[('Frames Processed',s['processed'],'Video analysis'),('Total Detections',s['detections'],'Across processed frames'),('Detection Confidence',f"{detection_conf*100:.1f}%",'Latest AI detection'),('Frame Sampling',f"1/{s['skip']}",'Video analysis')]):
+            with c:kpi(n,v,sub)
         if st.session_state.video_output:
             st.markdown('<div class="section">Processed Video Export</div>',unsafe_allow_html=True)
             st.caption('The live frame-by-frame preview above is the primary in-dashboard result. The processed MP4 remains available for export.')
             st.download_button('⬇ Download Detected Video',st.session_state.video_output,'sea_sentinel_video.mp4','video/mp4',width='stretch')
         if s['timeline']:
             fig=px.line(pd.DataFrame(s['timeline']),x='Frame',y='Detections',markers=True,title='Detections Across Processed Frames'); st.plotly_chart(transparent(fig,300),width='stretch',config={'displayModeBar':False})
-        st.caption('“Frame Detections” counts detections across sampled frames; it is not an estimate of unique physical vessels tracked through the video.')
+        st.caption('“Total Detections” counts detection instances across sampled frames; it is not an estimate of unique physical vessels tracked through the video.')
+        show_detection_results(st.session_state.video_last_predictions,'Latest Processed Frame Results')
 
 # ---------------- LIVE DETECTION ----------------
 elif page=='Live Detection':
@@ -608,6 +773,7 @@ elif page=='Live Detection':
         st.markdown('<div class="section">Live Configuration</div>',unsafe_allow_html=True)
         live_classes=st.multiselect('Vessel classes',VESSEL_CLASSES,default=VESSEL_CLASSES,format_func=pretty,key='live_classes')
         live_conf=st.slider('Confidence threshold',0.10,1.00,0.40,0.05,key='live_conf')
+        live_iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key='live_iou',help='Class-aware non-maximum suppression threshold for overlapping detections.')
         live_box=st.slider('Bounding box thickness',1,6,3,key='live_box')
         camera_index=st.number_input('Camera index',min_value=0,max_value=5,value=0,step=1,key='live_camera_index',help='0 is normally the built-in/default webcam. Try 1 for a USB camera.')
         live_duration=st.slider('Demo duration (seconds)',5,60,15,5,key='live_duration')
@@ -639,7 +805,8 @@ elif page=='Live Detection':
                         if (captured-1) % inference_every==0:
                             t0=time.perf_counter()
                             try:
-                                latest_preds=run_workflow(pil,live_classes,live_conf,0.7,live_box,'ROBOFLOW','Matplotlib Pastel1')
+                                latest_preds=run_workflow(pil,live_classes,live_conf,live_iou,0.7,live_box,'ROBOFLOW','Matplotlib Pastel1')
+                                st.session_state.live_last_predictions=latest_preds
                                 latency=time.perf_counter()-t0; inference_times.append(latency); inferred+=1; total_detections+=len(latest_preds)
                                 display_image=draw_detections(pil,latest_preds,live_box)
                                 if latest_preds:
@@ -662,6 +829,7 @@ elif page=='Live Detection':
                 for c,(n,v,note) in zip(m,values):
                     with c:kpi(n,v,note)
                 st.caption('Live Detection currently uses the Roboflow serverless workflow, so it requires internet access. The FPS value is the observed end-to-end AI processing rate, not the webcam hardware frame rate.')
+                show_detection_results(st.session_state.live_last_predictions,'Latest Live Detection Results')
 
 # ---------------- DETECTION ANALYTICS ----------------
 elif page=='Detection Analytics':
@@ -746,6 +914,7 @@ elif page=='Model Performance':
         severity_name={1:'Mild',2:'Mild–Moderate',3:'Moderate',4:'Strong',5:'Severe'}[severity]
         st.caption(f'Selected severity: {severity_name}')
         resilience_conf=st.slider('Inference confidence threshold',0.10,1.00,0.40,0.05,key='resilience_conf')
+        resilience_iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key='resilience_iou',help='Class-aware non-maximum suppression threshold applied equally to original and degraded predictions.')
         run_resilience=st.button('🧪 Run Resilience Test',type='primary',width='stretch',disabled=resilience_upload is None)
 
     if resilience_upload is not None:
@@ -763,14 +932,15 @@ elif page=='Model Performance':
         if run_resilience:
             with st.spinner('Running the same YOLO26 Nano workflow on the original and degraded images...'):
                 try:
-                    original_preds=run_workflow(original_resilience,VESSEL_CLASSES,resilience_conf,0.7,3,'ROBOFLOW','Matplotlib Pastel1')
-                    degraded_preds=run_workflow(degraded_resilience,VESSEL_CLASSES,resilience_conf,0.7,3,'ROBOFLOW','Matplotlib Pastel1')
+                    original_preds=run_workflow(original_resilience,VESSEL_CLASSES,resilience_conf,resilience_iou,0.7,3,'ROBOFLOW','Matplotlib Pastel1')
+                    degraded_preds=run_workflow(degraded_resilience,VESSEL_CLASSES,resilience_conf,resilience_iou,0.7,3,'ROBOFLOW','Matplotlib Pastel1')
                     st.session_state.resilience_result={
                         'filename':resilience_upload.name,
                         'degradation':degradation,
                         'severity':severity,
                         'severity_name':severity_name,
                         'threshold':resilience_conf,
+                        'iou_threshold':resilience_iou,
                         'original_image':original_resilience,
                         'degraded_image':degraded_resilience,
                         'original_preds':original_preds,
@@ -837,23 +1007,12 @@ elif page=='Model Performance':
                 'Confidence (%)':round(float(pred.get('confidence',0) or 0)*100,1)
             } for i,pred in enumerate(ordered,1)])
 
-        st.markdown('<div class="section">All Detected Classes</div>',unsafe_allow_html=True)
-        dleft,dright=st.columns(2,gap='large')
-        for col,label,preds in [
-            (dleft,'Original Image Detections',rr['original_preds']),
-            (dright,f"{rr['degradation']} · {rr['severity_name']} Detections",rr['degraded_preds'])
-        ]:
-            with col:
-                st.markdown(f'**{label}**')
-                detail_df=prediction_rows(preds)
-                if detail_df.empty:
-                    st.info('No detections above the selected confidence threshold.')
-                else:
-                    st.dataframe(detail_df,width='stretch',hide_index=True,column_config={
-                        '#':st.column_config.NumberColumn('#',format='%d',width='small'),
-                        'Detected Class':st.column_config.TextColumn('Detected Class',width='medium'),
-                        'Confidence (%)':st.column_config.NumberColumn('Confidence (%)',format='%.1f')
-                    })
+        st.markdown('<div class="section">Technical Detection Results</div>',unsafe_allow_html=True)
+        tleft,tright=st.columns(2,gap='large')
+        with tleft:
+            show_detection_results(rr['original_preds'],'Original Detection Results')
+        with tright:
+            show_detection_results(rr['degraded_preds'],f"{rr['degradation']} Detection Results")
 
         chart_df=comparison[['Condition','Top Conf. (%)']].copy()
         fig=px.bar(chart_df,x='Condition',y='Top Conf. (%)',text='Top Conf. (%)',title='Top Detection Confidence')
