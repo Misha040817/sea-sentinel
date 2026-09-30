@@ -1,4 +1,5 @@
 streamlit
+inference
 inference-sdk
 python-dotenv
 Pillow
