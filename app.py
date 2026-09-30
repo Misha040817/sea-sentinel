@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
-from inference_sdk import InferenceHTTPClient
+from inference import get_model
 
 st.set_page_config(page_title='Sea Sentinel', page_icon='🚢', layout='wide', initial_sidebar_state='expanded')
 load_dotenv()
@@ -16,6 +16,7 @@ load_dotenv()
 # ---------------- PROJECT CONSTANTS ----------------
 WORKSPACE = 'misha-r'
 WORKFLOW_ID = 'custom-workflow-2'
+MODEL_ID = 'misha-r/maritime-vessel-object-detection-3gfeg-3-yolo26n-t1'
 VESSEL_CLASSES = ['cargo_ship','container_ship','fishing_boat','military_vessel','passenger_ferry','speedboat','tanker','yacht']
 DATASET_COUNTS = {
     'Cargo Ship':117, 'Container Ship':126, 'Fishing Boat':100, 'Military Vessel':208,
@@ -233,7 +234,7 @@ st.markdown('''
 # ---------------- STATE ----------------
 for key, default in {
     'image_predictions':[], 'image_obj':None, 'image_name':None, 'history':[],
-    'video_stats':None, 'video_output':None, 'video_original':None, 'video_original_name':None, 'video_last_original':None, 'video_last_annotated':None, 'video_last_result':None, 'video_last_predictions':[], 'live_last_predictions':[], 'resilience_result':None
+    'video_stats':None, 'video_output':None, 'video_original':None, 'video_original_name':None, 'video_last_original':None, 'video_last_annotated':None, 'video_last_result':None, 'video_last_predictions':[], 'live_last_predictions':[], 'resilience_result':None, 'threat_predictions':[], 'threat_image':None, 'risk_result':None, 'image_assessment_open':False
 }.items():
     if key not in st.session_state: st.session_state[key] = default
 
@@ -252,7 +253,7 @@ def title(text, subtitle=''):
         <div class="hero-actions">
           <span class="hero-chip">⚓ YOLO26 Nano</span>
           <span class="hero-chip">◉ 8 Vessel Classes</span>
-          <span class="hero-chip">⌁ Roboflow Workflow</span>
+          <span class="hero-chip">⌁ Local AI Inference</span>
         </div>
       </div>
       <div class="ship-art"><div class="ship-hull"></div><div class="ship-deck"></div><div class="ship-cabin"></div><div class="ship-stack"></div></div>
@@ -290,7 +291,9 @@ def transparent(fig, height=340):
     fig.update_traces(selector=dict(type='bar'), marker_line_color='rgba(232,251,255,0.75)', marker_line_width=1.5, textfont=dict(color='#FFFFFF', size=13))
     fig.update_traces(selector=dict(type='pie'), marker=dict(line=dict(color='#071827', width=3)), textfont=dict(color='#FFFFFF', size=13))
     return fig
-def get_client():
+@st.cache_resource(show_spinner=False)
+def get_local_model():
+    """Load the cached YOLO26 model locally. No serverless inference call is used."""
     key = os.getenv('ROBOFLOW_API_KEY')
     if not key:
         try:
@@ -298,9 +301,9 @@ def get_client():
         except Exception:
             key = None
     if not key:
-        st.error('ROBOFLOW_API_KEY is missing. Add it to .env locally or Streamlit Secrets when deployed.')
+        st.error('ROBOFLOW_API_KEY is missing. Keep the existing key in .env so the cached local model can be opened.')
         st.stop()
-    return InferenceHTTPClient(api_url='https://serverless.roboflow.com', api_key=key)
+    return get_model(model_id=MODEL_ID, api_key=key)
 def box_iou(a, b):
     """IoU for Roboflow center-format boxes (x, y, width, height)."""
     def corners(p):
@@ -323,11 +326,29 @@ def apply_nms(predictions, iou_threshold=0.30):
     return kept
 
 def run_workflow(image, classes, confidence, iou_threshold, text_scale, box_thickness, box_palette, label_palette):
-    result = get_client().run_workflow(workspace_name=WORKSPACE,workflow_id=WORKFLOW_ID,images={'image':image},parameters={
-        'class_filter':classes,'text_scale':text_scale,'text_color':'Black','confidence':confidence,'text_thickness':1,
-        'text_position':'CENTER','bounding_box_thickness':box_thickness,'bounding_box_color_palette':box_palette,'label_color_palette':label_palette})
-    predictions=result[0].get('predictions',{}).get('predictions',[])
-    return apply_nms(predictions,iou_threshold)
+    """Run the cached YOLO26 model locally and preserve the dashboard prediction schema."""
+    model = get_local_model()
+    result = model.infer(image)
+    response = result[0] if isinstance(result, (list, tuple)) else result
+    raw_predictions = getattr(response, 'predictions', []) or []
+    predictions = []
+    selected = set(classes or [])
+    for pred in raw_predictions:
+        cls = getattr(pred, 'class_name', None)
+        conf = float(getattr(pred, 'confidence', 0) or 0)
+        if cls is None or conf < float(confidence):
+            continue
+        if selected and cls not in selected:
+            continue
+        predictions.append({
+            'x': float(getattr(pred, 'x', 0) or 0),
+            'y': float(getattr(pred, 'y', 0) or 0),
+            'width': float(getattr(pred, 'width', 0) or 0),
+            'height': float(getattr(pred, 'height', 0) or 0),
+            'confidence': conf,
+            'class': str(cls),
+        })
+    return apply_nms(predictions, iou_threshold)
 
 def prediction_detail_df(predictions):
     rows=[]
@@ -479,6 +500,20 @@ def summarize_predictions(predictions):
         'top_confidence': float(top.get('confidence', 0) or 0) if top else 0.0,
     }
 
+# ---------------- OPERATIONAL RISK ASSESSMENT ----------------
+def assess_operational_risk(vessel_class, confidence, restricted_area, unusual_behaviour, close_proximity):
+    """Explainable rule-based operational risk scoring; not a hostile-intent classifier."""
+    cls=str(vessel_class or '').lower(); conf=float(confidence or 0); score=0; factors=[]
+    if cls=='military_vessel': score+=2; factors.append(('Military vessel identified',2))
+    elif cls=='speedboat': score+=1; factors.append(('Speedboat identified',1))
+    if conf>=0.80: score+=1; factors.append(('High-confidence AI detection (>= 80%)',1))
+    if restricted_area: score+=3; factors.append(('In or near restricted / sensitive area',3))
+    if unusual_behaviour: score+=2; factors.append(('Suspicious / unusual behaviour observed',2))
+    if close_proximity: score+=2; factors.append(('Close to protected asset / area',2))
+    if score>=6: return 'HIGH ATTENTION','Immediate operator review and enhanced monitoring.',score,factors
+    if score>=3: return 'ELEVATED','Enhanced monitoring and operator review recommended.',score,factors
+    return 'ROUTINE','Continue routine monitoring.',score,factors
+
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sea_sentinel_history.db')
 
 def init_db():
@@ -554,10 +589,14 @@ def detection_controls(prefix='img'):
 with st.sidebar:
     st.markdown('<div class="brand"><h2>🌊 SEA SENTINEL</h2><p>Maritime Vision Intelligence</p></div>',unsafe_allow_html=True)
     st.markdown('<div class="eyebrow">NAVIGATION</div>',unsafe_allow_html=True)
-    page=st.radio('Page',['Dashboard','Image Detection','Video Detection','Live Detection','Detection Analytics','Dataset Analytics','Model Performance','Methodology','About Sea Sentinel'],label_visibility='collapsed')
+    nav_pages=['Dashboard','Image Detection','Video Detection','Live Detection','Operational Risk Assessment','Detection Analytics','Dataset Analytics','Model Performance','Methodology','About Sea Sentinel']
+    requested_page=st.session_state.pop('pending_nav',None)
+    if requested_page in nav_pages:
+        st.session_state.nav_page=requested_page
+    page=st.radio('Page',nav_pages,label_visibility='collapsed',key='nav_page')
     st.markdown('<div class="eyebrow">SYSTEM</div>',unsafe_allow_html=True)
     st.caption('Model · YOLO26 Nano')
-    st.caption('Workflow · Roboflow')
+    st.caption('Inference · Local / Offline')
     st.caption('Classes · 8 vessel classes')
 
 # ---------------- DASHBOARD ----------------
@@ -578,7 +617,7 @@ if page=='Dashboard':
         mc=st.columns(2)
         for i,(n,v) in enumerate(MODEL.items()):
             with mc[i%2]:kpi(n,f'{v:.1f}%','Validation result')
-        st.markdown('<div class="panel"><b>Model information</b><br><br><span class="soft">Model</span> &nbsp; YOLO26 Nano<br><span class="soft">Platform</span> &nbsp; Roboflow Workflows<br><span class="soft">Input</span> &nbsp; Maritime imagery<br><span class="soft">Classes</span> &nbsp; 8 vessel classes</div>',unsafe_allow_html=True)
+        st.markdown('<div class="panel"><b>Model information</b><br><br><span class="soft">Model</span> &nbsp; YOLO26 Nano<br><span class="soft">Platform</span> &nbsp; Local Roboflow Inference<br><span class="soft">Input</span> &nbsp; Maritime imagery<br><span class="soft">Classes</span> &nbsp; 8 vessel classes</div>',unsafe_allow_html=True)
     history_preview(8)
 
 # ---------------- IMAGE ----------------
@@ -615,7 +654,7 @@ elif page=='Image Detection':
                         st.session_state.image_predictions=preds; st.session_state.image_obj=image; st.session_state.image_name=upload.name
                         save_history('Image', upload.name, predictions=preds, threshold=conf)
                         st.success('Detection completed and saved to Detection History.')
-                    except Exception as e: st.error(f'Roboflow workflow error: {e}')
+                    except Exception as e: st.error(f'Local inference error: {e}')
         if st.session_state.image_obj is not None:
             image=st.session_state.image_obj; preds=st.session_state.image_predictions; annotated=draw_detections(image,preds,box)
             a,b=st.columns(2)
@@ -626,6 +665,33 @@ elif page=='Image Detection':
             for c,(n,v) in zip(metrics,vals):
                 with c:kpi(n,v,'Current uploaded image')
             show_detection_results(preds,'Detection Results',image_page=True)
+
+            # Hand off the completed image detection to the dedicated assessment page.
+            if preds:
+                top=max(preds,key=lambda x:float(x.get('confidence',0) or 0))
+                top_class=str(top.get('class','unknown'))
+                top_conf=float(top.get('confidence',0) or 0)
+
+                st.markdown('<div class="section">Operational Assessment</div>',unsafe_allow_html=True)
+                st.markdown(
+                    f'''<div class="panel">
+                    <b>⚓ Detection complete — continue to operational assessment</b><br><br>
+                    <span class="soft">Detected vessel</span> &nbsp; <b>{html.escape(pretty(top_class))}</b><br>
+                    <span class="soft">AI confidence</span> &nbsp; <b>{top_conf*100:.1f}%</b><br><br>
+                    <span class="soft">Continue to the dedicated assessment page to evaluate this detection using operator-provided operational context.</span>
+                    </div>''',
+                    unsafe_allow_html=True
+                )
+
+                if st.button('⚓ Continue to Operational Assessment →',type='primary',width='stretch',key='img_to_assessment'):
+                    st.session_state.threat_predictions=list(preds)
+                    st.session_state.threat_image=image.copy()
+                    st.session_state.threat_source='Image Detection'
+                    st.session_state.threat_source_name=st.session_state.get('image_name','Uploaded image')
+                    st.session_state.pending_nav='Operational Risk Assessment'
+                    st.rerun()
+            else:
+                st.info('Operational Assessment becomes available after at least one vessel is detected above the selected confidence threshold.')
     history_preview(6, 'Recent Saved Detections')
 
 # ---------------- VIDEO ----------------
@@ -766,7 +832,7 @@ elif page=='Video Detection':
 # ---------------- LIVE DETECTION ----------------
 elif page=='Live Detection':
     title('Live Vessel Detection','Capture a live webcam feed and run frame-by-frame Sea Sentinel vessel detection.')
-    st.markdown('<div class="panel"><b>Live camera inference</b><br><span class="soft">This page captures frames from a webcam connected to the computer running Sea Sentinel and sends selected frames through the existing YOLO26 Nano Roboflow workflow. The displayed processing rate includes camera capture, network and cloud-inference latency.</span></div>',unsafe_allow_html=True)
+    st.markdown('<div class="panel"><b>Live camera inference</b><br><span class="soft">This page captures frames from a webcam connected to the computer running Sea Sentinel and runs selected frames through the cached YOLO26 Nano model locally. The displayed processing rate includes camera capture and local AI-inference latency.</span></div>',unsafe_allow_html=True)
 
     control_col, live_col = st.columns([1,2.5],gap='large')
     with control_col:
@@ -777,7 +843,7 @@ elif page=='Live Detection':
         live_box=st.slider('Bounding box thickness',1,6,3,key='live_box')
         camera_index=st.number_input('Camera index',min_value=0,max_value=5,value=0,step=1,key='live_camera_index',help='0 is normally the built-in/default webcam. Try 1 for a USB camera.')
         live_duration=st.slider('Demo duration (seconds)',5,60,15,5,key='live_duration')
-        inference_every=st.slider('Run AI every Nth camera frame',1,30,5,key='live_every',help='Use 1 for every captured frame. Higher values reduce cloud API calls and may make the preview smoother.')
+        inference_every=st.slider('Run AI every Nth camera frame',1,30,5,key='live_every',help='Use 1 for every captured frame. Higher values reduce local inference workload and may make the preview smoother.')
         start_live=st.button('🔴 Start Live Detection',type='primary',width='stretch')
         st.caption('The session stops automatically after the selected duration. This prevents a camera loop from locking the Streamlit page.')
 
@@ -828,8 +894,76 @@ elif page=='Live Detection':
                 values=[('AI Frames',inferred,'Frames submitted for inference'),('Frame Detections',total_detections,'Across inferred frames'),('Avg Inference Latency',f'{avg_latency:.0f} ms','Includes network/cloud latency'),('Observed AI Rate',f'{observed_rate:.2f} FPS','Measured during this session')]
                 for c,(n,v,note) in zip(m,values):
                     with c:kpi(n,v,note)
-                st.caption('Live Detection currently uses the Roboflow serverless workflow, so it requires internet access. The FPS value is the observed end-to-end AI processing rate, not the webcam hardware frame rate.')
+                st.caption('Live Detection uses the cached local YOLO26 model and does not require internet access after the model has been cached. The FPS value is the observed end-to-end AI processing rate, not the webcam hardware frame rate.')
                 show_detection_results(st.session_state.live_last_predictions,'Latest Live Detection Results')
+
+# ---------------- OPERATIONAL RISK ASSESSMENT ----------------
+elif page=='Operational Risk Assessment':
+    title('Operational Risk Assessment','AI vessel detection with explainable operational risk assessment.')
+    st.markdown("""<style>
+    .risk-hero{border:2px solid rgba(34,211,238,.48);border-radius:18px;padding:18px 20px;background:linear-gradient(135deg,rgba(8,42,61,.96),rgba(6,24,38,.96));margin-bottom:16px}
+    .risk-badge{display:inline-block;padding:8px 13px;border-radius:10px;font-weight:900;letter-spacing:.4px}
+    .risk-low{background:rgba(16,185,129,.18);border:1px solid #10B981;color:#7FF3C4}.risk-med{background:rgba(245,158,11,.18);border:1px solid #F59E0B;color:#FFD166}.risk-high{background:rgba(239,68,68,.18);border:1px solid #EF4444;color:#FF8A8A}
+    .risk-score{font-size:2.05rem;font-weight:900;margin:7px 0}.factor-line{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid rgba(100,171,201,.18)}
+    </style>""",unsafe_allow_html=True)
+    st.markdown("""<div class="risk-hero"><b>🛡️ Explainable Decision Support</b><br><span class="soft">YOLO26 performs AI-based vessel detection and classification. The operational risk score combines detection evidence with simple operator-observed context. It indicates attention priority; it does not establish hostile intent.</span></div>""",unsafe_allow_html=True)
+
+    transferred=(st.session_state.get('threat_source')=='Image Detection' and st.session_state.get('threat_image') is not None and bool(st.session_state.get('threat_predictions')))
+    if not transferred and not (st.session_state.get('threat_image') is not None and bool(st.session_state.get('threat_predictions'))):
+        u1,u2=st.columns([2.2,1],gap='large')
+        with u1: risk_upload=st.file_uploader('Upload maritime image',type=['jpg','jpeg','png'],key='risk_upload')
+        with u2:
+            risk_conf=st.slider('Detection threshold',0.10,1.00,0.40,0.05,key='risk_conf'); risk_iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key='risk_iou')
+            run_detection=st.button('🚀 Run AI Detection',type='primary',width='stretch',disabled=risk_upload is None,key='risk_detect')
+        if risk_upload is not None and run_detection:
+            risk_image=Image.open(risk_upload).convert('RGB')
+            with st.spinner('Running local YOLO26 vessel detection...'):
+                try:
+                    risk_preds=run_workflow(risk_image,VESSEL_CLASSES,risk_conf,risk_iou,0.7,3,'ROBOFLOW','Matplotlib Pastel1')
+                    st.session_state.threat_predictions=risk_preds; st.session_state.threat_image=risk_image; st.session_state.threat_source='Risk Assessment'; st.session_state.threat_source_name=risk_upload.name; st.rerun()
+                except Exception as e: st.error(f'Operational risk detection error: {e}')
+
+    has_evidence=st.session_state.get('threat_image') is not None and bool(st.session_state.get('threat_predictions'))
+    if has_evidence:
+        preds=st.session_state.threat_predictions; risk_image=st.session_state.threat_image
+        top=max(preds,key=lambda x:float(x.get('confidence',0) or 0)); top_class=str(top.get('class','unknown')); top_conf=float(top.get('confidence',0) or 0)
+        left,right=st.columns([1.15,1],gap='large')
+        with left:
+            st.markdown('<div class="section">Detected Vessel · YOLO26</div>',unsafe_allow_html=True); st.image(draw_detections(risk_image,preds,3),width='stretch')
+            d1,d2=st.columns(2)
+            with d1:kpi('Detected Vessel',pretty(top_class),'Highest-confidence detection')
+            with d2:kpi('AI Confidence',f'{top_conf*100:.1f}%','YOLO26 class confidence')
+            with st.expander('Detection Evidence'): show_detection_results(preds,'Technical Detection Results',clean_table=True)
+        with right:
+            st.markdown('<div class="section">Operational Context</div>',unsafe_allow_html=True); st.caption('Provide observations that the current YOLO26 model does not predict.')
+            restricted=st.radio('📍 Restricted / Sensitive Area?',['No','Yes'],horizontal=True,key='risk_restricted')=='Yes'
+            unusual=st.radio('🔭 Suspicious / Unusual Behaviour?',['No','Yes'],horizontal=True,key='risk_unusual')=='Yes'
+            close=st.radio('🎯 Close to Protected Asset / Area?',['No','Yes'],horizontal=True,key='risk_close')=='Yes'
+            assess=st.button('🛡️ Assess Operational Risk',type='primary',width='stretch',key='assess_risk')
+            if assess:
+                level,action,score,factors=assess_operational_risk(top_class,top_conf,restricted,unusual,close)
+                st.session_state.risk_result={'level':level,'action':action,'score':score,'factors':factors,'class':top_class,'confidence':top_conf}
+        rrisk=st.session_state.get('risk_result')
+        if rrisk and rrisk.get('class')==top_class:
+            level=rrisk['level']; score=rrisk['score']; factors=rrisk['factors']; action=rrisk['action']; css={'ROUTINE':'risk-low','ELEVATED':'risk-med','HIGH ATTENTION':'risk-high'}[level]; icon={'ROUTINE':'🟢','ELEVATED':'🟠','HIGH ATTENTION':'🔴'}[level]
+            st.markdown('<div class="section">Operational Risk Assessment Result</div>',unsafe_allow_html=True)
+            st.markdown(f'<div class="panel" style="text-align:center;padding:22px"><span class="risk-badge {css}">{icon} {html.escape(level)}</span><div class="risk-score">Risk Score: {score} / 11</div><span class="soft">Explainable operational attention score</span></div>',unsafe_allow_html=True)
+            a,b=st.columns([1.3,1],gap='large')
+            with a:
+                st.markdown('<div class="section">Contributing Factors</div>',unsafe_allow_html=True)
+                fh=''.join(f'<div class="factor-line"><span>✓ {html.escape(label)}</span><b>+{pts}</b></div>' for label,pts in factors) if factors else '<div class="factor-line"><span>✓ No elevated scoring factors identified</span><b>+0</b></div>'
+                st.markdown(f'<div class="panel">{fh}</div>',unsafe_allow_html=True)
+            with b:
+                st.markdown('<div class="section">Recommended Action</div>',unsafe_allow_html=True); st.markdown(f'<div class="panel"><b>{html.escape(action)}</b><br><br><span class="soft">Supports operator review; not an autonomous threat declaration.</span></div>',unsafe_allow_html=True)
+            st.markdown('<div class="section">Risk Score Reference</div>',unsafe_allow_html=True); c1,c2,c3=st.columns(3)
+            with c1: st.markdown('<div class="panel" style="text-align:center;border-color:#10B981!important"><b>🟢 0–2</b><br>LOW / ROUTINE</div>',unsafe_allow_html=True)
+            with c2: st.markdown('<div class="panel" style="text-align:center;border-color:#F59E0B!important"><b>🟠 3–5</b><br>MEDIUM / ELEVATED</div>',unsafe_allow_html=True)
+            with c3: st.markdown('<div class="panel" style="text-align:center;border-color:#EF4444!important"><b>🔴 6–11</b><br>HIGH ATTENTION</div>',unsafe_allow_html=True)
+            st.markdown('<div class="section">Human Verification</div>',unsafe_allow_html=True); decision=st.radio('Operator decision',['Continue Monitoring','Flag for Review','No Further Action'],horizontal=True,key='operator_decision'); st.info(f'Operator selection: {decision}. Final threat determination remains with the human operator.')
+        if st.button('← Start New Assessment',width='stretch',key='new_risk_assessment'):
+            st.session_state.threat_predictions=[]; st.session_state.threat_image=None; st.session_state.threat_source=None; st.session_state.threat_source_name=None; st.session_state.risk_result=None; st.rerun()
+    elif not transferred:
+        st.markdown('<div class="panel" style="min-height:230px;display:flex;align-items:center;justify-content:center;text-align:center;"><div><div style="font-size:44px;margin-bottom:12px;">⚓</div><b>UPLOAD A MARITIME IMAGE</b><br><span class="soft">Sea Sentinel will run local YOLO26 detection before operational risk assessment.</span></div></div>',unsafe_allow_html=True)
 
 # ---------------- DETECTION ANALYTICS ----------------
 elif page=='Detection Analytics':
