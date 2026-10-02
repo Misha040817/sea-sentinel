@@ -1,4 +1,4 @@
-import os, io, cv2, tempfile, base64, sqlite3, json, subprocess, shutil, time, html
+import os, io, cv2, tempfile, base64, sqlite3, json, subprocess, shutil, time, html, re, difflib
 from datetime import datetime
 from collections import Counter
 import numpy as np
@@ -9,6 +9,7 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 from inference import get_model
+from transformers import AutoModelForCausalLM, CLIPModel, CLIPProcessor
 
 st.set_page_config(page_title='Sea Sentinel', page_icon='🚢', layout='wide', initial_sidebar_state='expanded')
 load_dotenv()
@@ -17,6 +18,14 @@ load_dotenv()
 WORKSPACE = 'misha-r'
 WORKFLOW_ID = 'custom-workflow-2'
 MODEL_ID = 'misha-r/maritime-vessel-object-detection-3gfeg-3-yolo26n-t1'
+CLIP_MODEL_ID = "openai/clip-vit-base-patch32"
+CLIP_SNAPSHOT = "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268"
+CLIP_LOCAL_PATH = os.path.join(
+    os.path.expanduser("~"),
+    ".cache", "huggingface", "hub",
+    "models--openai--clip-vit-base-patch32",
+    "snapshots", CLIP_SNAPSHOT,
+)
 VESSEL_CLASSES = ['cargo_ship','container_ship','fishing_boat','military_vessel','passenger_ferry','speedboat','tanker','yacht']
 DATASET_COUNTS = {
     'Cargo Ship':117, 'Container Ship':126, 'Fishing Boat':100, 'Military Vessel':208,
@@ -234,7 +243,7 @@ st.markdown('''
 # ---------------- STATE ----------------
 for key, default in {
     'image_predictions':[], 'image_obj':None, 'image_name':None, 'history':[],
-    'video_stats':None, 'video_output':None, 'video_original':None, 'video_original_name':None, 'video_last_original':None, 'video_last_annotated':None, 'video_last_result':None, 'video_last_predictions':[], 'live_last_predictions':[], 'resilience_result':None, 'threat_predictions':[], 'threat_image':None, 'risk_result':None, 'image_assessment_open':False
+    'video_stats':None, 'video_output':None, 'video_original':None, 'video_original_name':None, 'video_last_original':None, 'video_last_annotated':None, 'video_last_result':None, 'video_last_predictions':[], 'live_last_predictions':[], 'resilience_result':None, 'threat_predictions':[], 'threat_image':None, 'risk_result':None, 'scene_observation':None, 'image_assessment_open':False
 }.items():
     if key not in st.session_state: st.session_state[key] = default
 
@@ -500,19 +509,405 @@ def summarize_predictions(predictions):
         'top_confidence': float(top.get('confidence', 0) or 0) if top else 0.0,
     }
 
-# ---------------- OPERATIONAL RISK ASSESSMENT ----------------
-def assess_operational_risk(vessel_class, confidence, restricted_area, unusual_behaviour, close_proximity):
-    """Explainable rule-based operational risk scoring; not a hostile-intent classifier."""
-    cls=str(vessel_class or '').lower(); conf=float(confidence or 0); score=0; factors=[]
-    if cls=='military_vessel': score+=2; factors.append(('Military vessel identified',2))
-    elif cls=='speedboat': score+=1; factors.append(('Speedboat identified',1))
-    if conf>=0.80: score+=1; factors.append(('High-confidence AI detection (>= 80%)',1))
-    if restricted_area: score+=3; factors.append(('In or near restricted / sensitive area',3))
-    if unusual_behaviour: score+=2; factors.append(('Suspicious / unusual behaviour observed',2))
-    if close_proximity: score+=2; factors.append(('Close to protected asset / area',2))
-    if score>=6: return 'HIGH ATTENTION','Immediate operator review and enhanced monitoring.',score,factors
-    if score>=3: return 'ELEVATED','Enhanced monitoring and operator review recommended.',score,factors
-    return 'ROUTINE','Continue routine monitoring.',score,factors
+# ---------------- AUTOMATIC VISUAL RISK ASSESSMENT ----------------
+MOONDREAM_SNAPSHOT = "5d6c926f44e26b07957b0dd315bbedcb4c17a5fe"
+MOONDREAM_LOCAL_PATH = os.path.join(
+    os.path.expanduser("~"),
+    ".cache",
+    "huggingface",
+    "hub",
+    "models--vikhyatk--moondream2",
+    "snapshots",
+    MOONDREAM_SNAPSHOT,
+)
+
+STARMIE_SNAPSHOT = "35192e10a54e36eabe0a7cc57a2c1aab371cafc5"
+STARMIE_TOKENIZER_PATH = os.path.join(
+    os.path.expanduser("~"),
+    ".cache",
+    "huggingface",
+    "hub",
+    "models--moondream--starmie-v1",
+    "snapshots",
+    STARMIE_SNAPSHOT,
+    "tokenizer.json",
+)
+
+@st.cache_resource(show_spinner=False)
+def get_scene_observer():
+    """Load cached CLIP locally for fast air-gapped scene observation."""
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    required = (
+        "config.json",
+        "preprocessor_config.json",
+        "tokenizer.json",
+        "pytorch_model.bin",
+    )
+    missing = [
+        name for name in required
+        if not os.path.exists(os.path.join(CLIP_LOCAL_PATH, name))
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Local CLIP snapshot is incomplete. "
+            f"Expected path: {CLIP_LOCAL_PATH}. "
+            f"Missing: {', '.join(missing)}"
+        )
+
+    processor = CLIPProcessor.from_pretrained(
+        CLIP_LOCAL_PATH,
+        local_files_only=True,
+    )
+    model = CLIPModel.from_pretrained(
+        CLIP_LOCAL_PATH,
+        local_files_only=True,
+    )
+    model.eval()
+    return processor, model
+
+
+def _clip_group_scores(processor, model, image, labels):
+    import torch
+    inputs = processor(text=labels, images=image, return_tensors="pt", padding=True)
+    with torch.inference_mode():
+        outputs = model(**inputs)
+        scores = outputs.logits_per_image.softmax(dim=1)[0].detach().cpu().tolist()
+    return {label: float(score) for label, score in zip(labels, scores)}
+
+
+def _scene_regions(image):
+    """Overlapping context crops for image-dependent scene observation."""
+    w, h = image.size
+    boxes = {
+        "full": (0, 0, w, h),
+        "upper": (0, 0, w, max(1, int(h * 0.62))),
+        "left": (0, 0, max(1, int(w * 0.55)), h),
+        "center": (int(w * 0.20), 0, max(int(w * 0.80), int(w * 0.20) + 1), h),
+        "right": (int(w * 0.45), 0, w, h),
+    }
+    return {name: image.crop(box) for name, box in boxes.items()}
+
+
+def _best_region_evidence(processor, model, regions, present_label, absent_label):
+    best = {"region": "full", "present": 0.0, "absent": 1.0}
+    for region_name, region_img in regions.items():
+        scores = _clip_group_scores(processor, model, region_img, [present_label, absent_label])
+        present, absent = scores[present_label], scores[absent_label]
+        if present > best["present"]:
+            best = {"region": region_name, "present": present, "absent": absent}
+    return best
+
+
+@st.cache_resource(show_spinner=False)
+def get_signage_ocr_reader():
+    """Load EasyOCR from its local cache only; never download during competition use."""
+    try:
+        import easyocr
+    except Exception as exc:
+        raise RuntimeError(f"EasyOCR is unavailable in this environment: {exc}") from exc
+    return easyocr.Reader(["en"], gpu=False, download_enabled=False, verbose=False)
+
+
+def _signage_candidate_regions(image):
+    """Create location-agnostic overlapping crops so signage can appear anywhere in the scene."""
+    w, h = image.size
+    boxes = {
+        "full": (0, 0, w, h),
+        "upper_left": (0, 0, int(w * 0.55), int(h * 0.68)),
+        "upper_center": (int(w * 0.22), 0, int(w * 0.78), int(h * 0.68)),
+        "upper_right": (int(w * 0.45), 0, w, int(h * 0.68)),
+        "mid_left": (0, int(h * 0.20), int(w * 0.55), int(h * 0.82)),
+        "mid_center": (int(w * 0.22), int(h * 0.20), int(w * 0.78), int(h * 0.82)),
+        "mid_right": (int(w * 0.45), int(h * 0.20), w, int(h * 0.82)),
+    }
+    return {name: image.crop(box) for name, box in boxes.items()}
+
+
+def _warning_text_match(text):
+    """Return warning/restricted keywords supported by OCR text, including mild OCR misspellings."""
+    cleaned = re.sub(r"[^A-Z0-9 ]+", " ", str(text or "").upper())
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        return []
+    targets = [
+        "RESTRICTED", "RESTRICTED AREA", "MILITARY FACILITY", "WARNING",
+        "NO ENTRY", "PROHIBITED", "AUTHORIZED", "KEEP OUT", "DANGER",
+        "PRIVATE", "SECURITY AREA"
+    ]
+    hits=[]
+    for target in targets:
+        if target in cleaned:
+            hits.append(target)
+            continue
+        # Fuzzy comparison helps with small-text OCR such as RESTR1CTED / RESTRlCTED.
+        target_words=target.split()
+        words=cleaned.split()
+        if len(target_words)==1:
+            if any(difflib.SequenceMatcher(None, w, target).ratio() >= 0.78 for w in words if len(w) >= 4):
+                hits.append(target)
+        else:
+            n=len(target_words)
+            for i in range(max(0, len(words)-n+1)):
+                phrase=" ".join(words[i:i+n])
+                if difflib.SequenceMatcher(None, phrase, target).ratio() >= 0.78:
+                    hits.append(target); break
+    return sorted(set(hits))
+
+
+def verify_signage_with_targeted_ocr(image, processor, model):
+    """Use CLIP to choose likely sign crops, then EasyOCR only on the strongest candidates."""
+    candidates=_signage_candidate_regions(image)
+    present_label="a clearly visible warning sign, restricted area sign, no entry sign or prohibited access board"
+    absent_label="no clearly visible warning sign, restricted area sign, no entry sign or prohibited access board"
+    ranked=[]
+    for name, crop in candidates.items():
+        scores=_clip_group_scores(processor, model, crop, [present_label, absent_label])
+        ranked.append((scores[present_label]-scores[absent_label], scores[present_label], name, crop))
+    ranked.sort(reverse=True, key=lambda x:(x[0],x[1]))
+
+    # Accuracy-first test: OCR the two most sign-like regions, not the whole image repeatedly.
+    reader=get_signage_ocr_reader()
+    evidence=[]
+    debug=[]
+    for _, clip_present, name, crop in ranked[:2]:
+        arr=np.array(crop.convert("RGB"))
+        # Keep processing bounded while enlarging small text.
+        ch,cw=arr.shape[:2]
+        scale=min(2.4, max(1.4, 1500.0/max(cw,ch)))
+        arr=cv2.resize(arr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray=cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        gray=cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(gray)
+        results=reader.readtext(gray, detail=1, paragraph=False, decoder='greedy')
+        texts=[]
+        for item in results:
+            txt=str(item[1]).strip(); conf=float(item[2])
+            if txt:
+                texts.append(txt)
+                hits=_warning_text_match(txt)
+                if hits and conf >= 0.20:
+                    evidence.append({"region":name,"text":txt,"confidence":conf,"hits":hits})
+        # Also test joined OCR fragments so RESTRICTED + AREA can be verified together.
+        joined=" ".join(texts)
+        joined_hits=_warning_text_match(joined)
+        if joined_hits and texts and not evidence:
+            evidence.append({"region":name,"text":joined,"confidence":0.20,"hits":joined_hits})
+        debug.append(f"{name}: CLIP={clip_present:.3f}; OCR={texts or ['none']}")
+        if evidence:
+            break
+
+    return {
+        "verified": bool(evidence),
+        "evidence": evidence,
+        "debug": debug,
+        "candidate_regions": [x[2] for x in ranked[:2]],
+    }
+
+
+def run_scene_observation(image):
+    """Re-analyse every uploaded image using multi-region local CLIP."""
+    processor, model = get_scene_observer()
+    regions = _scene_regions(image)
+
+    # 1) Maritime infrastructure first, because clear shore-side structures are
+    # useful consistency evidence when deciding between open sea and coastal context.
+    ip_label = "shore-side maritime infrastructure such as a dock, jetty, port building, crane, tower or harbor structure is clearly visible"
+    ia_label = "no clear shore-side dock, jetty, port building, crane, tower or harbor infrastructure is visible"
+    infra = _best_region_evidence(processor, model, regions, ip_label, ia_label)
+    imargin = infra["present"] - infra["absent"]
+
+    if infra["present"] >= 0.68 and imargin >= 0.12:
+        infrastructure = f"Shore-side / maritime infrastructure cues detected ({infra['region']} region)"
+        infrastructure_status = "POSSIBLE"
+    elif infra["absent"] >= 0.68 and infra["absent"] > infra["present"]:
+        infrastructure = "No clear shore-side maritime infrastructure detected"
+        infrastructure_status = "NOT_INDICATED"
+    else:
+        infrastructure = "Maritime infrastructure context is visually uncertain"
+        infrastructure_status = "UNCONFIRMED"
+
+    # 2) Surrounding environment. Use several context crops, then apply a
+    # conservative consistency rule so a scene with strong shore infrastructure
+    # is not reported as purely open sea.
+    surroundings_labels = [
+        "an open sea or open water maritime environment with no nearby shoreline",
+        "a coastal or shoreline maritime environment with visible land or shore",
+        "a harbor or port maritime environment with port facilities",
+    ]
+    votes = {label: 0.0 for label in surroundings_labels}
+    for region_name in ("full", "upper", "left", "right"):
+        scores = _clip_group_scores(processor, model, regions[region_name], surroundings_labels)
+        weight = 1.15 if region_name == "upper" else 1.0
+        for label, score in scores.items():
+            votes[label] += score * weight
+
+    sb = max(votes, key=votes.get)
+    harbor_vote = votes[surroundings_labels[2]]
+    coastal_vote = votes[surroundings_labels[1]]
+    open_vote = votes[surroundings_labels[0]]
+
+    if "harbor" in sb:
+        surroundings = "Harbour / port maritime environment"
+        surroundings_status = "HARBOR_PORT"
+    elif "coastal" in sb:
+        surroundings = "Coastal / shore-adjacent maritime environment"
+        surroundings_status = "COASTAL"
+    else:
+        surroundings = "Open-water maritime environment"
+        surroundings_status = "OPEN_WATER"
+
+    # Open-water guard: moving vessels, masts and wakes can resemble fixed maritime
+    # structures to CLIP. When open-water evidence clearly dominates, do not let a
+    # weak infrastructure crop turn another vessel into shore-side infrastructure.
+    context_peak = max(coastal_vote, harbor_vote)
+    strong_open_water = surroundings_status == "OPEN_WATER" and open_vote >= context_peak * 1.25
+    if strong_open_water and infrastructure_status in {"POSSIBLE", "UNCONFIRMED"}:
+        infrastructure = "No clear shore-side maritime infrastructure detected"
+        infrastructure_status = "NOT_INDICATED"
+
+    # Consistency repair for genuinely shore-adjacent scenes. Only apply when the
+    # open-water guard above did not establish a clearly open-water context.
+    if infrastructure_status == "POSSIBLE" and surroundings_status == "OPEN_WATER":
+        if harbor_vote >= coastal_vote and harbor_vote >= open_vote * 0.72:
+            surroundings = "Harbour / port-adjacent maritime environment"
+            surroundings_status = "HARBOR_PORT"
+        elif coastal_vote >= open_vote * 0.78:
+            surroundings = "Coastal / shore-adjacent maritime environment"
+            surroundings_status = "COASTAL"
+        else:
+            infrastructure = "Maritime infrastructure context is visually uncertain"
+            infrastructure_status = "UNCONFIRMED"
+
+    # 3) Restricted/warning visual cue. CLIP is deliberately conservative here;
+    # it does not claim to read or verify small text.
+    sp_label = "a clearly visible warning sign, restricted area sign, no entry sign or prohibited access board"
+    sa_label = "no clearly visible warning sign, restricted area sign, no entry sign or prohibited access board"
+    sign = _best_region_evidence(processor, model, regions, sp_label, sa_label)
+    smargin = sign["present"] - sign["absent"]
+
+    if sign["present"] >= 0.72 and smargin >= 0.15:
+        signage = f"Possible restricted / warning signage visual cue ({sign['region']} region)"
+        signage_status = "POSSIBLE"
+    elif sign["absent"] >= 0.72 and sign["absent"] > sign["present"]:
+        signage = "No clear restricted / warning signage cue detected"
+        signage_status = "NOT_INDICATED"
+    else:
+        signage = "Restricted / warning signage is visually unconfirmed"
+        signage_status = "UNCONFIRMED"
+
+    # Targeted OCR verification: CLIP selects the most sign-like crops, then EasyOCR
+    # verifies readable warning/restricted wording. OCR evidence overrides CLIP uncertainty.
+    ocr_signage = verify_signage_with_targeted_ocr(image, processor, model)
+    if ocr_signage.get("verified"):
+        ev=ocr_signage["evidence"][0]
+        signage = f'Restricted / warning signage verified by OCR — text evidence: "{ev["text"]}"'
+        signage_status = "VERIFIED"
+
+    # 4) Vessel condition. This is a visual appearance check only; a single image
+    # cannot prove that a vessel is actually sinking or in distress.
+    condition_labels = [
+        "a vessel upright and normally oriented on the water, including a vessel underway, turning, viewed from above, or producing a wake",
+        "a vessel clearly and severely listing to one side, capsized, partially submerged, or in an obvious distress-like orientation",
+    ]
+    condition_scores = _clip_group_scores(processor, model, regions["full"], condition_labels)
+    normal_score = condition_scores[condition_labels[0]]
+    abnormal_score = condition_scores[condition_labels[1]]
+    condition_margin = abnormal_score - normal_score
+
+    # Deliberately high bar for distress. Camera angle, turning and wake alone must
+    # not be enough to create an abnormal-condition alert.
+    if abnormal_score >= 0.78 and condition_margin >= 0.28:
+        vessel_condition = "Possible abnormal listing / distress-like orientation detected"
+        condition_status = "ABNORMAL"
+    elif normal_score >= 0.62 and normal_score >= abnormal_score:
+        vessel_condition = "No obvious abnormal vessel orientation detected"
+        condition_status = "NORMAL"
+    else:
+        vessel_condition = "Insufficient visual evidence to assess vessel orientation"
+        condition_status = "UNCONFIRMED"
+
+    return {
+        "vessel": "Handled by YOLO26 vessel detection.",
+        "surroundings": surroundings,
+        "surroundings_status": surroundings_status,
+        "infrastructure": infrastructure,
+        "signage": signage,
+        "vessel_condition": vessel_condition,
+        "condition_status": condition_status,
+        "infrastructure_status": infrastructure_status,
+        "signage_status": signage_status,
+        "signage_ocr": ocr_signage,
+        "_raw": (
+            f"Multi-region CLIP: surroundings={sb}; votes(open/coastal/harbor)="
+            f"{open_vote:.3f}/{coastal_vote:.3f}/{harbor_vote:.3f}; "
+            f"infrastructure region={infra['region']} present/absent={infra['present']:.3f}/{infra['absent']:.3f}; "
+            f"signage region={sign['region']} present/absent={sign['present']:.3f}/{sign['absent']:.3f}; "
+            f"OCR verified={ocr_signage.get('verified')} candidates={ocr_signage.get('candidate_regions')}; "
+            f"condition normal/abnormal={normal_score:.3f}/{abnormal_score:.3f}. "
+            "Scores are relative semantic matches, not calibrated probabilities."
+        ),
+    }
+
+
+
+def _norm(text):
+    return " ".join(str(text or "").lower().split())
+
+def validate_scene_observation(obs):
+    """Interpret grouped CLIP outputs conservatively and preserve scene consistency."""
+    infra_status = str(obs.get("infrastructure_status", "UNCONFIRMED"))
+    signage_status = str(obs.get("signage_status", "UNCONFIRMED"))
+    condition_status = str(obs.get("condition_status", "UNCONFIRMED"))
+    surroundings_status = str(obs.get("surroundings_status", "UNCONFIRMED"))
+    contradiction = infra_status == "POSSIBLE" and surroundings_status == "OPEN_WATER"
+    return {
+        "infrastructure_status": infra_status,
+        "signage_status": signage_status,
+        "condition_status": condition_status,
+        "surroundings_status": surroundings_status,
+        "contradiction": contradiction,
+    }
+
+
+
+def assess_automatic_visual_priority(vessel_class, confidence, observation, validation):
+    """Preliminary visual threat-priority support; not hostile-intent classification."""
+    cls = str(vessel_class or "").lower()
+    conf = float(confidence or 0)
+    score, factors = 0, []
+
+    if cls == "military_vessel":
+        score += 3
+        factors.append(("High-priority military-vessel class detected by YOLO26", 3))
+    elif cls in {"speedboat", "tanker"}:
+        score += 1
+        factors.append((f"{pretty(cls)} class flagged for enhanced visual monitoring", 1))
+
+    if conf >= 0.80:
+        score += 1
+        factors.append(("High-confidence YOLO26 vessel classification", 1))
+
+    if validation.get("infrastructure_status") == "POSSIBLE":
+        score += 1
+        factors.append(("Possible maritime-infrastructure visual cues identified by CLIP", 1))
+
+    if validation.get("signage_status") == "VERIFIED":
+        score += 2
+        factors.append(("Restricted / warning signage text verified by local OCR", 2))
+    elif validation.get("signage_status") == "POSSIBLE":
+        score += 2
+        factors.append(("Possible restricted / warning signage visual cue identified by CLIP", 2))
+
+    if validation.get("condition_status") == "ABNORMAL":
+        score += 2
+        factors.append(("Possible abnormal vessel orientation / distress-like visual condition identified by CLIP", 2))
+
+    if score >= 4:
+        return "HIGH VISUAL PRIORITY", "Prioritize the contact for operator verification and continued monitoring.", score, factors
+    if score >= 2:
+        return "ELEVATED VISUAL PRIORITY", "Continue enhanced visual monitoring and verify contextual information.", score, factors
+    return "LOW VISUAL PRIORITY", "Continue routine visual monitoring.", score, factors
+
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sea_sentinel_history.db')
 
@@ -589,7 +984,7 @@ def detection_controls(prefix='img'):
 with st.sidebar:
     st.markdown('<div class="brand"><h2>🌊 SEA SENTINEL</h2><p>Maritime Vision Intelligence</p></div>',unsafe_allow_html=True)
     st.markdown('<div class="eyebrow">NAVIGATION</div>',unsafe_allow_html=True)
-    nav_pages=['Dashboard','Image Detection','Video Detection','Live Detection','Operational Risk Assessment','Detection Analytics','Dataset Analytics','Model Performance','Methodology','About Sea Sentinel']
+    nav_pages=['Dashboard','Image Detection','Video Detection','Live Detection','Operational Risk Assessment','Model Resilience','Detection Analytics','Dataset Analytics','Model Performance','Methodology','About Sea Sentinel']
     requested_page=st.session_state.pop('pending_nav',None)
     if requested_page in nav_pages:
         st.session_state.nav_page=requested_page
@@ -678,7 +1073,7 @@ elif page=='Image Detection':
                     <b>⚓ Detection complete — continue to operational assessment</b><br><br>
                     <span class="soft">Detected vessel</span> &nbsp; <b>{html.escape(pretty(top_class))}</b><br>
                     <span class="soft">AI confidence</span> &nbsp; <b>{top_conf*100:.1f}%</b><br><br>
-                    <span class="soft">Continue to the dedicated assessment page to evaluate this detection using operator-provided operational context.</span>
+                    <span class="soft">Continue to the dedicated assessment page for automatic local scene observation and explainable visual-priority assessment.</span>
                     </div>''',
                     unsafe_allow_html=True
                 )
@@ -899,144 +1294,221 @@ elif page=='Live Detection':
 
 # ---------------- OPERATIONAL RISK ASSESSMENT ----------------
 elif page=='Operational Risk Assessment':
-    title('Operational Risk Assessment','AI vessel detection with explainable operational risk assessment.')
+    title('Operational Risk Assessment','Automatic local scene observation + YOLO26 detection for explainable visual-priority support.')
     st.markdown("""<style>
-    .risk-hero{border:2px solid rgba(34,211,238,.48);border-radius:18px;padding:18px 20px;background:linear-gradient(135deg,rgba(8,42,61,.96),rgba(6,24,38,.96));margin-bottom:16px}
-    .risk-badge{display:inline-block;padding:8px 13px;border-radius:10px;font-weight:900;letter-spacing:.4px}
-    .risk-low{background:rgba(16,185,129,.18);border:1px solid #10B981;color:#7FF3C4}.risk-med{background:rgba(245,158,11,.18);border:1px solid #F59E0B;color:#FFD166}.risk-high{background:rgba(239,68,68,.18);border:1px solid #EF4444;color:#FF8A8A}
-    .risk-score{font-size:2.05rem;font-weight:900;margin:7px 0}.factor-line{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid rgba(100,171,201,.18)}
-    </style>""",unsafe_allow_html=True)
-    st.markdown("""<div class="risk-hero"><b>🛡️ Explainable Decision Support</b><br><span class="soft">YOLO26 performs AI-based vessel detection and classification. The operational risk score combines detection evidence with simple operator-observed context. It indicates attention priority; it does not establish hostile intent.</span></div>""",unsafe_allow_html=True)
+    @keyframes ssPulse {
+      0%,100% { box-shadow:0 0 0 0 rgba(239,68,68,.08), 0 0 18px rgba(34,211,238,.10); }
+      50% { box-shadow:0 0 0 5px rgba(239,68,68,.10), 0 0 32px rgba(239,68,68,.22); }
+    }
+    @keyframes ssBeacon {
+      0%,100% { opacity:.35; transform:scale(.82); }
+      50% { opacity:1; transform:scale(1.18); }
+    }
+    .ai-observe-box{
+      position:relative;background:rgba(12,34,51,.82);
+      border:1px solid rgba(34,211,238,.55);border-radius:18px;
+      padding:18px 18px 10px 18px;margin-bottom:14px;
+    }
+    .ai-observe-box.alert-active{
+      border-color:rgba(239,68,68,.82);animation:ssPulse 1.15s ease-in-out infinite;
+    }
+    .alert-beacon{
+      display:inline-block;width:10px;height:10px;border-radius:50%;
+      background:#ef4444;margin-right:8px;vertical-align:1px;
+      animation:ssBeacon .72s ease-in-out infinite;
+    }
+    .obs-row{padding:10px 0 12px 0;border-bottom:1px solid rgba(120,170,195,.16)}
+    .obs-row:last-child{border-bottom:none}
+    .obs-title{font-weight:900;margin-bottom:4px}
+    .assessment-reason{line-height:1.65;font-size:.96rem}
+    .priority-badge{display:inline-flex;align-items:center;justify-content:center;min-width:290px;padding:13px 24px;border-radius:9px;font-size:1.12rem;font-weight:950;letter-spacing:.9px;text-transform:uppercase;border:1px solid transparent}
+    .cue-box{margin-top:12px;background:rgba(8,29,42,.78);border:1px solid rgba(87,173,204,.28);border-radius:12px;padding:12px 16px}
+    .cue-heading{font-size:.72rem;font-weight:900;letter-spacing:1px;margin-bottom:6px;color:#d8edf5}
+    .cue-row{display:grid;grid-template-columns:28px 1fr auto;align-items:center;gap:8px;padding:8px 0;border-top:1px solid rgba(120,170,195,.13)}
+    .cue-symbol{width:22px;height:22px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;font-weight:950}
+    .cue-yes{color:#7ce7a6;background:rgba(48,190,105,.12);border:1px solid rgba(75,220,130,.35)}
+    .cue-no{color:#f29a9a;background:rgba(220,70,70,.10);border:1px solid rgba(230,90,90,.28)}
+    .cue-unknown{color:#ffd37a;background:rgba(220,165,55,.10);border:1px solid rgba(235,180,70,.28)}
+    .cue-label{font-size:.86rem;font-weight:700}.cue-state{font-size:.78rem;color:#9fc0cf;font-weight:700}
+    .priority-low{color:#9FF7D0;background:rgba(16,185,129,.13);border-color:rgba(16,185,129,.72);box-shadow:0 0 18px rgba(16,185,129,.10)}
+    .priority-elevated{color:#FFD58A;background:rgba(245,158,11,.13);border-color:rgba(245,158,11,.78);box-shadow:0 0 18px rgba(245,158,11,.13)}
+    .priority-high{color:#FFD1D1;background:rgba(239,68,68,.15);border-color:rgba(239,68,68,.88);animation:ssPriorityPulse 1.15s ease-in-out infinite}
+    @keyframes ssPriorityPulse{0%,100%{box-shadow:0 0 10px rgba(239,68,68,.18)}50%{box-shadow:0 0 26px rgba(239,68,68,.48)}}
+    </style>""", unsafe_allow_html=True)
+    st.markdown('''<div class="panel"><b>Automatic visual assessment</b><br><span class="soft">
+    YOLO26 detects and classifies vessels. A second local vision model observes visible scene context.
+    Contradictory or uncertain scene observations are marked <b>UNCONFIRMED</b> and do not increase the score.
+    This is decision support, not autonomous hostile-intent detection.</span></div>''',unsafe_allow_html=True)
+    st.caption('FAST AIR-GAP mode · multi-region CLIP checks surroundings, maritime infrastructure, restricted/warning visual cues and vessel condition.')
 
-    transferred=(st.session_state.get('threat_source')=='Image Detection' and st.session_state.get('threat_image') is not None and bool(st.session_state.get('threat_predictions')))
-    if not transferred and not (st.session_state.get('threat_image') is not None and bool(st.session_state.get('threat_predictions'))):
-        u1,u2=st.columns([2.2,1],gap='large')
-        with u1: risk_upload=st.file_uploader('Upload maritime image',type=['jpg','jpeg','png'],key='risk_upload')
-        with u2:
-            risk_conf=st.slider('Detection threshold',0.10,1.00,0.40,0.05,key='risk_conf'); risk_iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key='risk_iou')
-            run_detection=st.button('🚀 Run AI Detection',type='primary',width='stretch',disabled=risk_upload is None,key='risk_detect')
-        if risk_upload is not None and run_detection:
-            risk_image=Image.open(risk_upload).convert('RGB')
-            with st.spinner('Running local YOLO26 vessel detection...'):
+    source_note=st.session_state.get('threat_source')
+    if source_note and st.session_state.get('threat_image') is not None:
+        st.info(f"Detection evidence loaded from {source_note}: {st.session_state.get('threat_source_name','maritime image')}")
+
+    upload_col,config_col=st.columns([1.5,1],gap='large')
+    with upload_col:
+        risk_upload=st.file_uploader('Upload maritime image for automatic assessment',type=['jpg','jpeg','png'],key='risk_upload')
+    with config_col:
+        risk_conf=st.slider('YOLO26 confidence threshold',0.10,1.00,0.40,0.05,key='risk_conf')
+        risk_iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key='risk_iou')
+        run_detection=st.button('🚀 Run Automatic Assessment',type='primary',width='stretch',disabled=risk_upload is None,key='risk_detect')
+
+    if risk_upload is not None and run_detection:
+        risk_image=Image.open(risk_upload).convert('RGB')
+        with st.spinner('Step 1/2 · Running local YOLO26 vessel detection...'):
+            try:
+                risk_preds=run_workflow(risk_image,VESSEL_CLASSES,risk_conf,risk_iou,0.7,3,'ROBOFLOW','Matplotlib Pastel1')
+                st.session_state.threat_predictions=risk_preds
+                st.session_state.threat_image=risk_image
+                st.session_state.threat_source='Risk Assessment'
+                st.session_state.threat_source_name=risk_upload.name
+                st.session_state.scene_observation=None
+                st.session_state.risk_result=None
+            except Exception as e:
+                st.error(f'YOLO26 detection error: {e}'); risk_preds=[]
+
+        if risk_preds:
+            with st.spinner('Step 2/2 · Running CLIP scene analysis + targeted offline OCR signage verification...'):
                 try:
-                    risk_preds=run_workflow(risk_image,VESSEL_CLASSES,risk_conf,risk_iou,0.7,3,'ROBOFLOW','Matplotlib Pastel1')
-                    st.session_state.threat_predictions=risk_preds; st.session_state.threat_image=risk_image; st.session_state.threat_source='Risk Assessment'; st.session_state.threat_source_name=risk_upload.name; st.rerun()
-                except Exception as e: st.error(f'Operational risk detection error: {e}')
+                    observation=run_scene_observation(risk_image)
+                    validation=validate_scene_observation(observation)
+                    top=max(risk_preds,key=lambda x:float(x.get('confidence',0) or 0))
+                    top_class=str(top.get('class','unknown')); top_conf=float(top.get('confidence',0) or 0)
+                    level,action,score,factors=assess_automatic_visual_priority(top_class,top_conf,observation,validation)
+                    st.session_state.scene_observation=observation
+                    st.session_state.risk_result={'level':level,'action':action,'score':score,'factors':factors,'class':top_class,'confidence':top_conf,'validation':validation}
+                    st.success('Automatic local visual assessment completed.')
+                except Exception as e:
+                    st.error(f'Local scene-observation error: {e}')
+        else:
+            st.warning('No vessel was detected above the selected threshold, so visual-priority assessment was not generated.')
 
     has_evidence=st.session_state.get('threat_image') is not None and bool(st.session_state.get('threat_predictions'))
     if has_evidence:
         preds=st.session_state.threat_predictions; risk_image=st.session_state.threat_image
-        top=max(preds,key=lambda x:float(x.get('confidence',0) or 0)); top_class=str(top.get('class','unknown')); top_conf=float(top.get('confidence',0) or 0)
-        left,right=st.columns([1.15,1],gap='large')
+        top=max(preds,key=lambda x:float(x.get('confidence',0) or 0))
+        top_class=str(top.get('class','unknown')); top_conf=float(top.get('confidence',0) or 0)
+
+        left,right=st.columns([1.1,1],gap='large')
         with left:
-            st.markdown('<div class="section">Detected Vessel · YOLO26</div>',unsafe_allow_html=True); st.image(draw_detections(risk_image,preds,3),width='stretch')
+            st.markdown('<div class="section">Detected Vessel · YOLO26</div>',unsafe_allow_html=True)
+            st.image(draw_detections(risk_image,preds,3),width='stretch')
             d1,d2=st.columns(2)
             with d1:kpi('Detected Vessel',pretty(top_class),'Highest-confidence detection')
-            with d2:kpi('AI Confidence',f'{top_conf*100:.1f}%','YOLO26 class confidence')
+            with d2:kpi('AI Confidence',f'{top_conf*100:.1f}%','Class confidence — not threat probability')
             with st.expander('Detection Evidence'): show_detection_results(preds,'Technical Detection Results',clean_table=True)
+
         with right:
-            st.markdown('<div class="section">Operational Context</div>',unsafe_allow_html=True); st.caption('Provide observations that the current YOLO26 model does not predict.')
-            restricted=st.radio('📍 Restricted / Sensitive Area?',['No','Yes'],horizontal=True,key='risk_restricted')=='Yes'
-            unusual=st.radio('🔭 Suspicious / Unusual Behaviour?',['No','Yes'],horizontal=True,key='risk_unusual')=='Yes'
-            close=st.radio('🎯 Close to Protected Asset / Area?',['No','Yes'],horizontal=True,key='risk_close')=='Yes'
-            assess=st.button('🛡️ Assess Operational Risk',type='primary',width='stretch',key='assess_risk')
-            if assess:
-                level,action,score,factors=assess_operational_risk(top_class,top_conf,restricted,unusual,close)
-                st.session_state.risk_result={'level':level,'action':action,'score':score,'factors':factors,'class':top_class,'confidence':top_conf}
+            st.markdown('<div class="section">Automatic AI Observation</div>',unsafe_allow_html=True)
+            obs=st.session_state.get('scene_observation'); rrisk=st.session_state.get('risk_result')
+            if obs:
+                validation=rrisk.get('validation',{}) if rrisk else validate_scene_observation(obs)
+                alert_active = (
+                    validation.get('signage_status') in {'POSSIBLE','VERIFIED'}
+                    or validation.get('infrastructure_status') == 'POSSIBLE'
+                    or validation.get('condition_status') == 'ABNORMAL'
+                    or (rrisk and rrisk.get('level') == 'HIGH VISUAL PRIORITY')
+                )
+                alert_class=' alert-active' if alert_active else ''
+                beacon='<span class="alert-beacon"></span>' if alert_active else ''
+                observation_html = (
+                    f'<div class="ai-observe-box{alert_class}">'
+                    f'<div style="font-size:.76rem;font-weight:900;letter-spacing:1px;margin-bottom:4px">{beacon}AUTOMATIC VISUAL CONTEXT</div>'
+                    f'<div class="obs-row"><div class="obs-title">SURROUNDING ENVIRONMENT</div><span class="soft">{html.escape(str(obs.get("surroundings","Unconfirmed")))}</span></div>'
+                    f'<div class="obs-row"><div class="obs-title">MARITIME INFRASTRUCTURE</div><span class="soft">{html.escape(str(obs.get("infrastructure","Unconfirmed")))}</span></div>'
+                    f'<div class="obs-row"><div class="obs-title">RESTRICTED / WARNING INDICATOR</div><span class="soft">{html.escape(str(obs.get("signage","Unconfirmed")))}</span></div>'
+                    f'<div class="obs-row"><div class="obs-title">VESSEL VISUAL CONDITION</div><span class="soft">{html.escape(str(obs.get("vessel_condition","Unconfirmed")))}</span></div>'
+                    f'</div>'
+                )
+                st.markdown(observation_html,unsafe_allow_html=True)
+                st.caption('The pulsing visual alert indicates an elevated visual-priority/context cue. It is a UI alert only; no audible alarm is generated.')
+            else:
+                st.info('Run Automatic Assessment to generate local AI scene observations.')
+
         rrisk=st.session_state.get('risk_result')
         if rrisk and rrisk.get('class')==top_class:
-            level=rrisk['level']; score=rrisk['score']; factors=rrisk['factors']; action=rrisk['action']; css={'ROUTINE':'risk-low','ELEVATED':'risk-med','HIGH ATTENTION':'risk-high'}[level]; icon={'ROUTINE':'🟢','ELEVATED':'🟠','HIGH ATTENTION':'🔴'}[level]
-            st.markdown('<div class="section">Operational Risk Assessment Result</div>',unsafe_allow_html=True)
-            st.markdown(f'<div class="panel" style="text-align:center;padding:22px"><span class="risk-badge {css}">{icon} {html.escape(level)}</span><div class="risk-score">Risk Score: {score} / 11</div><span class="soft">Explainable operational attention score</span></div>',unsafe_allow_html=True)
-            a,b=st.columns([1.3,1],gap='large')
+            level=rrisk['level']; score=rrisk['score']; factors=rrisk['factors']; action=rrisk['action']
+            validation=rrisk.get('validation',{})
+            obs=st.session_state.get('scene_observation') or {}
+            priority_class={'LOW VISUAL PRIORITY':'priority-low','ELEVATED VISUAL PRIORITY':'priority-elevated','HIGH VISUAL PRIORITY':'priority-high'}[level]
+
+            st.markdown('<div class="section">Preliminary Threat Assessment</div>',unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="ai-observe-box" style="text-align:center;padding:24px">'
+                f'<div class="priority-badge {priority_class}">{html.escape(level)}</div>'
+                f'<div class="soft" style="margin-top:12px">Automatic visual-priority assessment · not a hostile-intent probability</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+            reason_parts=[]
+            if top_class == 'military_vessel':
+                reason_parts.append(f'a high-priority military vessel was detected by YOLO26 with {top_conf*100:.1f}% confidence')
+            else:
+                reason_parts.append(f'a {pretty(top_class).lower()} was detected by YOLO26 with {top_conf*100:.1f}% confidence')
+
+            surroundings=str(obs.get('surroundings','')).strip()
+            if surroundings:
+                reason_parts.append(f'the surrounding scene is most consistent with {surroundings.lower()}')
+
+            if validation.get('infrastructure_status') == 'POSSIBLE':
+                reason_parts.append('CLIP identified possible maritime-infrastructure visual cues')
+            elif validation.get('infrastructure_status') == 'NOT_INDICATED':
+                reason_parts.append('no strong maritime-infrastructure cue was indicated')
+
+            if validation.get('signage_status') == 'VERIFIED':
+                ocr_ev=(obs.get('signage_ocr') or {}).get('evidence') or []
+                ocr_text=ocr_ev[0].get('text','') if ocr_ev else ''
+                if ocr_text:
+                    reason_parts.append(f'restricted or warning signage text was verified by local OCR ("{ocr_text}")')
+                else:
+                    reason_parts.append('restricted or warning signage text was verified by local OCR')
+            elif validation.get('signage_status') == 'POSSIBLE':
+                reason_parts.append('possible restricted or warning signage was visually indicated and should be verified')
+            elif validation.get('signage_status') == 'NOT_INDICATED':
+                reason_parts.append('no strong restricted or warning signage cue was indicated')
+            else:
+                reason_parts.append('restricted or warning signage remains visually unconfirmed')
+
+            if validation.get('condition_status') == 'ABNORMAL':
+                reason_parts.append('the vessel shows a possible abnormal listing, partial-submersion or distress-like visual orientation that requires operator verification')
+            elif validation.get('condition_status') == 'NORMAL':
+                reason_parts.append('the vessel appears upright and normally oriented in the available image')
+            else:
+                reason_parts.append('the single image provides insufficient visual evidence to assess vessel orientation')
+
+            if len(reason_parts) == 1:
+                professional_reason = reason_parts[0].capitalize() + '.'
+            else:
+                professional_reason = (
+                    reason_parts[0].capitalize() + '. '
+                    + '; '.join(reason_parts[1:]).capitalize() + '. '
+                    + 'These combined visual indicators determine the preliminary priority for operator review.'
+                )
+
+            a,b=st.columns([1.35,1],gap='large')
             with a:
-                st.markdown('<div class="section">Contributing Factors</div>',unsafe_allow_html=True)
-                fh=''.join(f'<div class="factor-line"><span>✓ {html.escape(label)}</span><b>+{pts}</b></div>' for label,pts in factors) if factors else '<div class="factor-line"><span>✓ No elevated scoring factors identified</span><b>+0</b></div>'
-                st.markdown(f'<div class="panel">{fh}</div>',unsafe_allow_html=True)
+                st.markdown('<div class="section">Assessment Reason</div>',unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="panel assessment-reason">{html.escape(professional_reason)}</div>',
+                    unsafe_allow_html=True
+                )
             with b:
-                st.markdown('<div class="section">Recommended Action</div>',unsafe_allow_html=True); st.markdown(f'<div class="panel"><b>{html.escape(action)}</b><br><br><span class="soft">Supports operator review; not an autonomous threat declaration.</span></div>',unsafe_allow_html=True)
-            st.markdown('<div class="section">Risk Score Reference</div>',unsafe_allow_html=True); c1,c2,c3=st.columns(3)
-            with c1: st.markdown('<div class="panel" style="text-align:center;border-color:#10B981!important"><b>🟢 0–2</b><br>LOW / ROUTINE</div>',unsafe_allow_html=True)
-            with c2: st.markdown('<div class="panel" style="text-align:center;border-color:#F59E0B!important"><b>🟠 3–5</b><br>MEDIUM / ELEVATED</div>',unsafe_allow_html=True)
-            with c3: st.markdown('<div class="panel" style="text-align:center;border-color:#EF4444!important"><b>🔴 6–11</b><br>HIGH ATTENTION</div>',unsafe_allow_html=True)
-            st.markdown('<div class="section">Human Verification</div>',unsafe_allow_html=True); decision=st.radio('Operator decision',['Continue Monitoring','Flag for Review','No Further Action'],horizontal=True,key='operator_decision'); st.info(f'Operator selection: {decision}. Final threat determination remains with the human operator.')
-        if st.button('← Start New Assessment',width='stretch',key='new_risk_assessment'):
-            st.session_state.threat_predictions=[]; st.session_state.threat_image=None; st.session_state.threat_source=None; st.session_state.threat_source_name=None; st.session_state.risk_result=None; st.rerun()
-    elif not transferred:
-        st.markdown('<div class="panel" style="min-height:230px;display:flex;align-items:center;justify-content:center;text-align:center;"><div><div style="font-size:44px;margin-bottom:12px;">⚓</div><b>UPLOAD A MARITIME IMAGE</b><br><span class="soft">Sea Sentinel will run local YOLO26 detection before operational risk assessment.</span></div></div>',unsafe_allow_html=True)
+                st.markdown('<div class="section">Recommended Action</div>',unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="panel"><b>{html.escape(action)}</b><br><br>'
+                    f'<span class="soft">Possible signage, infrastructure or vessel-condition cues are visual indicators only and require operator verification. '
+                    f'A single image does not establish hostile intent or legal restricted-zone status.</span></div>',
+                    unsafe_allow_html=True
+                )
+            st.caption('Sea Sentinel combines local YOLO26 vessel detection with local multi-region CLIP scene-context matching. The animated alert is visual only and highlights elevated evidence for operator attention.')
 
-# ---------------- DETECTION ANALYTICS ----------------
-elif page=='Detection Analytics':
-    title('Detection Analytics','Persistent history of Sea Sentinel image and video analyses.')
-    hist=load_history()
-    if hist.empty:
-        st.info('No saved detection history yet. Run Image Detection or Video Detection and the results will be stored here automatically.')
     else:
-        total_analyses=len(hist); total_detections=int(hist['detections'].sum()); avg_conf=float(hist['avg_confidence'].mean()*100); image_runs=int((hist['source_type']=='Image').sum())
-        cols=st.columns(4)
-        for c,(n,v,note) in zip(cols,[('Saved Analyses',total_analyses,'Persistent records'),('Total Detections',total_detections,'Across saved analyses'),('Average Confidence',f'{avg_conf:.1f}%','Across analyses'),('Image Analyses',image_runs,'Saved image runs')]):
-            with c:kpi(n,v,note)
-        chart_df=hist.copy(); chart_df['timestamp']=pd.to_datetime(chart_df['timestamp']); chart_df=chart_df.sort_values('timestamp'); chart_df['Average Confidence (%)']=chart_df['avg_confidence']*100
-        c1,c2=st.columns([1.35,1],gap='large')
-        with c1:
-            fig=px.line(chart_df,x='timestamp',y='detections',markers=True,color='source_type',title='Detection Activity Over Time',labels={'timestamp':'Date / Time','detections':'Detections','source_type':'Source'})
-            st.plotly_chart(transparent(fig,330),width='stretch',config={'displayModeBar':False})
-        with c2:
-            agg=Counter()
-            for raw in hist['class_counts'].fillna('{}'):
-                try: agg.update(json.loads(raw))
-                except Exception: pass
-            if agg:
-                cc=pd.DataFrame({'Vessel Type':list(agg.keys()),'Detections':list(agg.values())})
-                fig=px.pie(cc,names='Vessel Type',values='Detections',hole=.58,title='Historical Vessel Distribution')
-                st.plotly_chart(transparent(fig,330),width='stretch',config={'displayModeBar':False})
-            else: st.info('Class-level history will appear after detections are recorded.')
-        st.markdown('<div class="section">Saved Detection History</div>',unsafe_allow_html=True)
-        display=hist[['timestamp','source_type','filename','detections','avg_confidence','max_confidence','vessel_types','threshold']].copy()
-        display['timestamp']=pd.to_datetime(display['timestamp']).dt.strftime('%d %b %Y, %H:%M:%S')
-        display['avg_confidence']=(display['avg_confidence']*100).round(1).astype(str)+'%'
-        display['max_confidence']=(display['max_confidence']*100).round(1).astype(str)+'%'
-        display['threshold']=(display['threshold']*100).round(0).astype(int).astype(str)+'%'
-        display.columns=['Date / Time','Source','File','Detections','Avg Confidence','Highest Confidence','Vessel Types','Threshold']
-        st.dataframe(display,width='stretch',hide_index=True)
-        st.download_button('⬇ Export History CSV',display.to_csv(index=False).encode('utf-8'),'sea_sentinel_detection_history.csv','text/csv')
-        with st.expander('History management'):
-            st.warning('Clearing history permanently deletes the locally stored detection records.')
-            confirm=st.checkbox('I understand and want to clear the saved history',key='confirm_clear_history')
-            if st.button('Clear Detection History',disabled=not confirm):
-                clear_history(); st.success('Detection history cleared.'); st.rerun()
-    preds=st.session_state.image_predictions
-    if preds:
-        st.markdown('<div class="section">Latest Image Detection Details</div>',unsafe_allow_html=True)
-        rows=[]
-        for i,p in enumerate(preds,1): rows.append({'#':i,'Vessel Type':pretty(p.get('class','unknown')),'Confidence (%)':round(p.get('confidence',0)*100,1),'X':round(p.get('x',0),1),'Y':round(p.get('y',0),1),'Width':round(p.get('width',0),1),'Height':round(p.get('height',0),1)})
-        st.dataframe(pd.DataFrame(rows),width='stretch',hide_index=True)
+        st.info('Upload an image above, or continue here from Image Detection, to begin automatic visual assessment.')
 
-# ---------------- DATASET ----------------
-elif page=='Dataset Analytics':
-    title('Dataset Analytics','Exploration of the maritime vessel dataset used by Sea Sentinel.')
-    cols=st.columns(5)
-    for c,(n,v) in zip(cols,[('Total Images','2,241'),('Vessel Classes','8'),('Training','1,569'),('Validation','403'),('Testing','269')]):
-        with c:kpi(n,v,'Dataset composition')
-    c1,c2=st.columns([1.4,1],gap='large')
-    with c1:
-        df=pd.DataFrame({'Vessel':DATASET_COUNTS.keys(),'Images':DATASET_COUNTS.values()}); fig=px.bar(df,x='Vessel',y='Images',text='Images',title='Class Distribution'); fig.update_traces(textposition='outside'); st.plotly_chart(transparent(fig),width='stretch',config={'displayModeBar':False})
-    with c2:
-        split=pd.DataFrame({'Split':['Training','Validation','Testing'],'Images':[1569,403,269]}); fig=px.pie(split,names='Split',values='Images',hole=.62,title='Dataset Split'); st.plotly_chart(transparent(fig),width='stretch',config={'displayModeBar':False})
-        st.caption('The displayed split is 1,569 training, 403 validation and 269 testing images.')
-
-# ---------------- MODEL ----------------
-elif page=='Model Performance':
-    title('Model Performance','Evaluation results for YOLO26 Nano on the maritime vessel dataset.')
-    cols=st.columns(4)
-    for c,(n,v) in zip(cols,MODEL.items()):
-        with c:kpi(n,f'{v:.1f}%','Validation metric')
-    df=pd.DataFrame({'Class':CLASS_MAP50.keys(),'mAP@50 (%)':CLASS_MAP50.values()})
-    fig=px.bar(df,x='mAP@50 (%)',y='Class',orientation='h',text='mAP@50 (%)',title='Per-Class Performance')
-    fig.update_xaxes(range=[0,100])
-    st.plotly_chart(transparent(fig,420),width='stretch',config={'displayModeBar':False})
-    st.info('Model-performance values above are project-level evaluation metrics. Live image/video confidence values are kept separate on the detection pages.')
-
+# ---------------- MODEL RESILIENCE ----------------
+elif page=='Model Resilience':
+    title('Model Resilience','Controlled visual-degradation testing using the same local YOLO26 Nano model.')
     st.markdown('<div class="section">Model Resilience to Visual Degradation</div>',unsafe_allow_html=True)
     st.markdown('''<div class="panel"><b>Controlled resilience test</b><br><span class="soft">Upload one maritime test image, create a degraded copy, and process both versions using the same YOLO26 Nano workflow. This test does not retrain or modify the model. Results below are live inference results, not dataset-level validation metrics.</span></div>''',unsafe_allow_html=True)
 
@@ -1162,10 +1634,84 @@ elif page=='Model Performance':
 
         st.caption('Interpretation note: this is a controlled single-image resilience comparison. It does not by itself establish overall model robustness. Aggregate resilience claims should be based on multiple test images and conditions.')
 
+
+# ---------------- DETECTION ANALYTICS ----------------
+elif page=='Detection Analytics':
+    title('Detection Analytics','Persistent history of Sea Sentinel image and video analyses.')
+    hist=load_history()
+    if hist.empty:
+        st.info('No saved detection history yet. Run Image Detection or Video Detection and the results will be stored here automatically.')
+    else:
+        total_analyses=len(hist); total_detections=int(hist['detections'].sum()); avg_conf=float(hist['avg_confidence'].mean()*100); image_runs=int((hist['source_type']=='Image').sum())
+        cols=st.columns(4)
+        for c,(n,v,note) in zip(cols,[('Saved Analyses',total_analyses,'Persistent records'),('Total Detections',total_detections,'Across saved analyses'),('Average Confidence',f'{avg_conf:.1f}%','Across analyses'),('Image Analyses',image_runs,'Saved image runs')]):
+            with c:kpi(n,v,note)
+        chart_df=hist.copy(); chart_df['timestamp']=pd.to_datetime(chart_df['timestamp']); chart_df=chart_df.sort_values('timestamp'); chart_df['Average Confidence (%)']=chart_df['avg_confidence']*100
+        c1,c2=st.columns([1.35,1],gap='large')
+        with c1:
+            fig=px.line(chart_df,x='timestamp',y='detections',markers=True,color='source_type',title='Detection Activity Over Time',labels={'timestamp':'Date / Time','detections':'Detections','source_type':'Source'})
+            st.plotly_chart(transparent(fig,330),width='stretch',config={'displayModeBar':False})
+        with c2:
+            agg=Counter()
+            for raw in hist['class_counts'].fillna('{}'):
+                try: agg.update(json.loads(raw))
+                except Exception: pass
+            if agg:
+                cc=pd.DataFrame({'Vessel Type':list(agg.keys()),'Detections':list(agg.values())})
+                fig=px.pie(cc,names='Vessel Type',values='Detections',hole=.58,title='Historical Vessel Distribution')
+                st.plotly_chart(transparent(fig,330),width='stretch',config={'displayModeBar':False})
+            else: st.info('Class-level history will appear after detections are recorded.')
+        st.markdown('<div class="section">Saved Detection History</div>',unsafe_allow_html=True)
+        display=hist[['timestamp','source_type','filename','detections','avg_confidence','max_confidence','vessel_types','threshold']].copy()
+        display['timestamp']=pd.to_datetime(display['timestamp']).dt.strftime('%d %b %Y, %H:%M:%S')
+        display['avg_confidence']=(display['avg_confidence']*100).round(1).astype(str)+'%'
+        display['max_confidence']=(display['max_confidence']*100).round(1).astype(str)+'%'
+        display['threshold']=(display['threshold']*100).round(0).astype(int).astype(str)+'%'
+        display.columns=['Date / Time','Source','File','Detections','Avg Confidence','Highest Confidence','Vessel Types','Threshold']
+        st.dataframe(display,width='stretch',hide_index=True)
+        st.download_button('⬇ Export History CSV',display.to_csv(index=False).encode('utf-8'),'sea_sentinel_detection_history.csv','text/csv')
+        with st.expander('History management'):
+            st.warning('Clearing history permanently deletes the locally stored detection records.')
+            confirm=st.checkbox('I understand and want to clear the saved history',key='confirm_clear_history')
+            if st.button('Clear Detection History',disabled=not confirm):
+                clear_history(); st.success('Detection history cleared.'); st.rerun()
+    preds=st.session_state.image_predictions
+    if preds:
+        st.markdown('<div class="section">Latest Image Detection Details</div>',unsafe_allow_html=True)
+        rows=[]
+        for i,p in enumerate(preds,1): rows.append({'#':i,'Vessel Type':pretty(p.get('class','unknown')),'Confidence (%)':round(p.get('confidence',0)*100,1),'X':round(p.get('x',0),1),'Y':round(p.get('y',0),1),'Width':round(p.get('width',0),1),'Height':round(p.get('height',0),1)})
+        st.dataframe(pd.DataFrame(rows),width='stretch',hide_index=True)
+
+# ---------------- DATASET ----------------
+elif page=='Dataset Analytics':
+    title('Dataset Analytics','Exploration of the maritime vessel dataset used by Sea Sentinel.')
+    cols=st.columns(5)
+    for c,(n,v) in zip(cols,[('Total Images','2,241'),('Vessel Classes','8'),('Training','1,569'),('Validation','403'),('Testing','269')]):
+        with c:kpi(n,v,'Dataset composition')
+    c1,c2=st.columns([1.4,1],gap='large')
+    with c1:
+        df=pd.DataFrame({'Vessel':DATASET_COUNTS.keys(),'Images':DATASET_COUNTS.values()}); fig=px.bar(df,x='Vessel',y='Images',text='Images',title='Class Distribution'); fig.update_traces(textposition='outside'); st.plotly_chart(transparent(fig),width='stretch',config={'displayModeBar':False})
+    with c2:
+        split=pd.DataFrame({'Split':['Training','Validation','Testing'],'Images':[1569,403,269]}); fig=px.pie(split,names='Split',values='Images',hole=.62,title='Dataset Split'); st.plotly_chart(transparent(fig),width='stretch',config={'displayModeBar':False})
+        st.caption('The displayed split is 1,569 training, 403 validation and 269 testing images.')
+
+# ---------------- MODEL ----------------
+elif page=='Model Performance':
+    title('Model Performance','Evaluation results for YOLO26 Nano on the maritime vessel dataset.')
+    cols=st.columns(4)
+    for c,(n,v) in zip(cols,MODEL.items()):
+        with c:kpi(n,f'{v:.1f}%','Validation metric')
+    df=pd.DataFrame({'Class':CLASS_MAP50.keys(),'mAP@50 (%)':CLASS_MAP50.values()})
+    fig=px.bar(df,x='mAP@50 (%)',y='Class',orientation='h',text='mAP@50 (%)',title='Per-Class Performance')
+    fig.update_xaxes(range=[0,100])
+    st.plotly_chart(transparent(fig,420),width='stretch',config={'displayModeBar':False})
+    st.info('Model-performance values above are project-level evaluation metrics. Live image/video confidence values are kept separate on the detection pages.')
+
+
 # ---------------- METHOD ----------------
 elif page=='Methodology':
     title('Methodology','Sea Sentinel computer-vision workflow from data to live detection.')
-    steps=[('1','Dataset Collection','2,241 maritime images across 8 vessel classes.'),('2','Data Preparation','Images organised into training, validation and testing splits.'),('3','Model Training','YOLO26 Nano trained through the project workflow.'),('4','Evaluation','mAP@50, precision, recall, F1 and per-class performance.'),('5','Live Inference','Uploaded images and sampled video frames are sent to Roboflow Workflows.'),('6','Visual Analytics','Bounding boxes, confidence values, class distribution and detection tables are presented.')]
+    steps=[('1','Dataset Collection','2,241 maritime images across 8 vessel classes.'),('2','Data Preparation','Images organised into training, validation and testing splits.'),('3','Model Training','YOLO26 Nano trained through the project workflow.'),('4','Evaluation','mAP@50, precision, recall, F1 and per-class performance.'),('5','Live Inference','Uploaded images and sampled video frames are processed locally by the cached YOLO26 model.'),('6','Visual Analytics','Bounding boxes, confidence values, class distribution and detection tables are presented.')]
     for n,h,d in steps: st.markdown(f'<div class="panel"><span class="pill">STEP {n}</span><h3>{h}</h3><div class="soft">{d}</div></div>',unsafe_allow_html=True)
 
 # ---------------- ABOUT ----------------
