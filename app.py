@@ -535,34 +535,27 @@ STARMIE_TOKENIZER_PATH = os.path.join(
 
 @st.cache_resource(show_spinner=False)
 def get_scene_observer():
-    """Load cached CLIP locally for fast air-gapped scene observation."""
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    """Load CLIP from the local cache when available; otherwise allow cloud download."""
     required = (
         "config.json",
         "preprocessor_config.json",
         "tokenizer.json",
-        "pytorch_model.bin",
     )
-    missing = [
-        name for name in required
-        if not os.path.exists(os.path.join(CLIP_LOCAL_PATH, name))
-    ]
-    if missing:
-        raise FileNotFoundError(
-            "Local CLIP snapshot is incomplete. "
-            f"Expected path: {CLIP_LOCAL_PATH}. "
-            f"Missing: {', '.join(missing)}"
-        )
+    local_ready = os.path.isdir(CLIP_LOCAL_PATH) and all(
+        os.path.exists(os.path.join(CLIP_LOCAL_PATH, name)) for name in required
+    )
 
-    processor = CLIPProcessor.from_pretrained(
-        CLIP_LOCAL_PATH,
-        local_files_only=True,
-    )
-    model = CLIPModel.from_pretrained(
-        CLIP_LOCAL_PATH,
-        local_files_only=True,
-    )
+    if local_ready:
+        processor = CLIPProcessor.from_pretrained(CLIP_LOCAL_PATH, local_files_only=True)
+        model = CLIPModel.from_pretrained(CLIP_LOCAL_PATH, local_files_only=True)
+    else:
+        # Streamlit Cloud starts without the competition laptop's Hugging Face cache.
+        # Remove inherited offline flags and let Transformers download/cache CLIP normally.
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        processor = CLIPProcessor.from_pretrained(CLIP_MODEL_ID)
+        model = CLIPModel.from_pretrained(CLIP_MODEL_ID)
+
     model.eval()
     return processor, model
 
@@ -601,12 +594,20 @@ def _best_region_evidence(processor, model, regions, present_label, absent_label
 
 @st.cache_resource(show_spinner=False)
 def get_signage_ocr_reader():
-    """Load EasyOCR from its local cache only; never download during competition use."""
+    """Use cached EasyOCR models when present; allow first-run download on cloud hosts."""
     try:
         import easyocr
     except Exception as exc:
         raise RuntimeError(f"EasyOCR is unavailable in this environment: {exc}") from exc
-    return easyocr.Reader(["en"], gpu=False, download_enabled=False, verbose=False)
+
+    model_dir = os.path.join(os.path.expanduser("~"), ".EasyOCR", "model")
+    detector = os.path.join(model_dir, "craft_mlt_25k.pth")
+    recognizer_candidates = [
+        os.path.join(model_dir, "english_g2.pth"),
+        os.path.join(model_dir, "latin_g2.pth"),
+    ]
+    local_ready = os.path.exists(detector) and any(os.path.exists(p) for p in recognizer_candidates)
+    return easyocr.Reader(["en"], gpu=False, download_enabled=not local_ready, verbose=False)
 
 
 def _signage_candidate_regions(image):
