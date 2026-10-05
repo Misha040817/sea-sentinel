@@ -972,13 +972,13 @@ def history_preview(limit=8, heading='Recent Detection History'):
 init_db()
 
 def detection_controls(prefix='img'):
-    classes=st.multiselect('Vessel classes',VESSEL_CLASSES,default=VESSEL_CLASSES,format_func=pretty,key=f'{prefix}_classes')
-    confidence=st.slider('Confidence threshold',0.10,1.00,0.40,0.05,key=f'{prefix}_conf')
+    classes=st.multiselect('Vessel classes',VESSEL_CLASSES,default=VESSEL_CLASSES,format_func=pretty,key=f'{prefix}_classes',help='Select which of the 8 trained vessel classes are shown in the detection results. This filters displayed detections; it does not retrain the model.')
+    confidence=st.slider('Confidence threshold',0.10,1.00,0.40,0.05,key=f'{prefix}_conf',help='Minimum YOLO26 detection confidence required to keep a prediction. For example, 0.40 keeps predictions at 40% confidence or higher. This is not model accuracy or threat probability.')
     iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key=f'{prefix}_iou',help='Class-aware non-maximum suppression threshold for overlapping detections. Lower values suppress overlapping boxes more aggressively.')
-    box=st.slider('Bounding box thickness',1,6,3,key=f'{prefix}_box')
-    text=st.slider('Text scale',0.5,2.0,0.7,0.1,key=f'{prefix}_text')
-    label=st.selectbox('Label color palette',['Matplotlib Pastel1','Matplotlib Set1','Matplotlib Tab10'],key=f'{prefix}_label')
-    palette=st.selectbox('Bounding box palette',['ROBOFLOW','Matplotlib Cividis'],key=f'{prefix}_palette')
+    box=st.slider('Bounding box thickness',1,6,3,key=f'{prefix}_box',help='Controls only the visual thickness of detection boxes. It does not affect AI inference or detection accuracy.')
+    text=st.slider('Text scale',0.5,2.0,0.7,0.1,key=f'{prefix}_text',help='Controls the displayed detection-label text size only. It does not affect model inference.')
+    label=st.selectbox('Label color palette',['Matplotlib Pastel1','Matplotlib Set1','Matplotlib Tab10'],key=f'{prefix}_label',help='Selects the visual colour scheme for detection labels only; it does not affect predictions.')
+    palette=st.selectbox('Bounding box palette',['ROBOFLOW','Matplotlib Cividis'],key=f'{prefix}_palette',help='Selects the visual colour scheme for bounding boxes only; it does not affect predictions.')
     return classes,confidence,iou,box,text,label,palette
 
 # ---------------- SIDEBAR ----------------
@@ -1096,7 +1096,7 @@ elif page=='Video Detection':
     left,right=st.columns([1,2.5],gap='large')
     with left:
         classes,conf,iou,box,text_scale,label_palette,box_palette=detection_controls('vid')
-        frame_skip=st.slider('Process every Nth frame',1,30,10,key='frame_skip')
+        frame_skip=st.slider('Process every Nth frame',1,30,10,key='frame_skip',help='Runs YOLO26 on every Nth video frame. A higher value reduces processing workload and speeds up analysis, but samples fewer frames.')
     with right:
         video=st.file_uploader('Upload maritime video',type=['mp4','avi','mov','mkv'],key='video_upload')
         if video:
@@ -1233,13 +1233,13 @@ elif page=='Live Detection':
     control_col, live_col = st.columns([1,2.5],gap='large')
     with control_col:
         st.markdown('<div class="section">Live Configuration</div>',unsafe_allow_html=True)
-        live_classes=st.multiselect('Vessel classes',VESSEL_CLASSES,default=VESSEL_CLASSES,format_func=pretty,key='live_classes')
-        live_conf=st.slider('Confidence threshold',0.10,1.00,0.40,0.05,key='live_conf')
+        live_classes=st.multiselect('Vessel classes',VESSEL_CLASSES,default=VESSEL_CLASSES,format_func=pretty,key='live_classes',help='Select which trained vessel classes are shown during live detection. This filters displayed detections and does not retrain the model.')
+        live_conf=st.slider('Confidence threshold',0.10,1.00,0.40,0.05,key='live_conf',help='Minimum YOLO26 confidence required to display a live detection. 0.40 means predictions below 40% confidence are filtered out; it is not model accuracy or threat probability.')
         live_iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key='live_iou',help='Class-aware non-maximum suppression threshold for overlapping detections.')
-        live_box=st.slider('Bounding box thickness',1,6,3,key='live_box')
-        camera_index=st.number_input('Camera index',min_value=0,max_value=5,value=0,step=1,key='live_camera_index',help='0 is normally the built-in/default webcam. Try 1 for a USB camera.')
-        live_duration=st.slider('Demo duration (seconds)',5,60,15,5,key='live_duration')
-        inference_every=st.slider('Run AI every Nth camera frame',1,30,5,key='live_every',help='Use 1 for every captured frame. Higher values reduce local inference workload and may make the preview smoother.')
+        live_box=st.slider('Bounding box thickness',1,6,3,key='live_box',help='Controls only the displayed bounding-box thickness during live detection. It does not affect AI inference.')
+        camera_index=st.number_input('Camera index',min_value=0,max_value=5,value=0,step=1,key='live_camera_index',help='Selects which camera device OpenCV opens. 0 is normally the built-in/default webcam; 1 or higher can represent an external/USB camera.')
+        live_duration=st.slider('Demo duration (seconds)',5,60,15,5,key='live_duration',help='Sets how long the live-camera demonstration runs before stopping automatically.')
+        inference_every=st.slider('Run AI every Nth camera frame',1,30,5,key='live_every',help='Controls how often YOLO26 runs on the live camera feed. 1 analyses every captured frame; higher values sample fewer frames, reducing local inference workload and often making the preview smoother.')
         start_live=st.button('🔴 Start Live Detection',type='primary',width='stretch')
         st.caption('The session stops automatically after the selected duration. This prevents a camera loop from locking the Streamlit page.')
 
@@ -1350,8 +1350,8 @@ elif page=='Operational Risk Assessment':
     with upload_col:
         risk_upload=st.file_uploader('Upload maritime image for automatic assessment',type=['jpg','jpeg','png'],key='risk_upload')
     with config_col:
-        risk_conf=st.slider('YOLO26 confidence threshold',0.10,1.00,0.40,0.05,key='risk_conf')
-        risk_iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key='risk_iou')
+        risk_conf=st.slider('YOLO26 confidence threshold',0.10,1.00,0.40,0.05,key='risk_conf',help='Minimum YOLO26 confidence required for a vessel detection to be used in the automatic visual assessment. This is a detection filter, not a threat probability.')
+        risk_iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key='risk_iou',help='Class-aware non-maximum suppression threshold used to remove duplicate overlapping vessel detections before the visual assessment.')
         run_detection=st.button('🚀 Run Automatic Assessment',type='primary',width='stretch',disabled=risk_upload is None,key='risk_detect')
 
     if risk_upload is not None and run_detection:
@@ -1516,12 +1516,12 @@ elif page=='Model Resilience':
     control_col, preview_col = st.columns([1,2.25],gap='large')
     with control_col:
         resilience_upload=st.file_uploader('Upload resilience test image',type=['jpg','jpeg','png'],key='resilience_upload')
-        degradation=st.selectbox('Visual degradation',['Gaussian Noise','Blur','Low Light','Fog / Haze'],key='resilience_degradation')
-        severity=st.slider('Degradation severity',1,5,3,key='resilience_severity',help='1 = mild, 5 = severe')
+        degradation=st.selectbox('Visual degradation',['Gaussian Noise','Blur','Low Light','Fog / Haze'],key='resilience_degradation',help='Chooses a controlled visual degradation applied to a copy of the uploaded image so the same YOLO26 model can be compared on original versus degraded input. It does not retrain the model.')
+        severity=st.slider('Degradation severity',1,5,3,key='resilience_severity',help='Controls the strength of the selected simulated degradation: 1 = mild and 5 = severe. This is a controlled image transformation, not a claim that it reproduces every real maritime condition.')
         severity_name={1:'Mild',2:'Mild–Moderate',3:'Moderate',4:'Strong',5:'Severe'}[severity]
         st.caption(f'Selected severity: {severity_name}')
-        resilience_conf=st.slider('Inference confidence threshold',0.10,1.00,0.40,0.05,key='resilience_conf')
-        resilience_iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key='resilience_iou',help='Class-aware non-maximum suppression threshold applied equally to original and degraded predictions.')
+        resilience_conf=st.slider('Inference confidence threshold',0.10,1.00,0.40,0.05,key='resilience_conf',help='Minimum YOLO26 confidence used for both the original and degraded images so the resilience comparison uses the same detection filter.')
+        resilience_iou=st.slider('IoU threshold',0.10,0.90,0.30,0.05,key='resilience_iou',help='Class-aware non-maximum suppression threshold applied equally to original and degraded predictions to suppress duplicate overlapping boxes.')
         run_resilience=st.button('🧪 Run Resilience Test',type='primary',width='stretch',disabled=resilience_upload is None)
 
     if resilience_upload is not None:
